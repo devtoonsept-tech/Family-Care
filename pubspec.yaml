@@ -1,0 +1,74 @@
+
+name: family_care
+
+description: "A new Flutter project for Medical"
+
+publish_to: 'none'
+
+version: 1.0.0+1
+
+# ==========================================
+# DART SDK
+# ==========================================
+
+environment:
+  sdk: ^3.12.2
+
+# ==========================================
+# APP DEPENDENCIES
+# ==========================================
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Flutter Icons
+  cupertino_icons: ^1.0.8
+
+  # Image Selection
+  image_picker: ^1.2.4
+
+  # HTTP API Requests
+  http: ^1.6.0
+
+  # Secure Login Token Storage
+  flutter_secure_storage: ^11.2.0
+
+  # PDF and Image File Selection
+  # Used by Health Reports Screen
+  file_picker: ^13.3.0
+
+  # Open PDF and External Links
+  # Used by Health Reports Screen
+  url_launcher: ^6.3.3
+
+# ==========================================
+# DEVELOPMENT DEPENDENCIES
+# ==========================================
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+# ==========================================
+# FLUTTER CONFIGURATION
+# ==========================================
+
+flutter:
+  uses-material-design: true
+
+  # ========================================
+  # APPLICATION ASSETS
+  # ========================================
+
+  assets:
+    # FamilyCare+ Signup Hero Image
+    # Mother, Father and Infant
+    - assets/images/signup_family.png
+    - assets/images/login_family.png
+    - assets/images/dashboard_family.png
+    - assets/images/dashboard_child.png
+    - assets/images/dashboard_women.png
+    - assets/images/dashboard_adult.png
