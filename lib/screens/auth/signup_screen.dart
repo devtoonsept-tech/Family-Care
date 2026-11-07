@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -15,11 +14,17 @@ import 'otp_verification.dart';
 // ============================================================
 //
 // Patient:
-// Personal Details -> Register API -> Email OTP
+// Personal Details -> Register API -> Email OTP -> Patient login
 //
 // Doctor:
-// Personal Details -> Professional Details
-// -> Register API -> Email OTP
+// Personal Details -> Professional Details -> Register API -> Email OTP
+// -> Doctor Profile Setup (prefilled professional fields, addresses,
+//    experience, profile photo, degree certificate) -> Admin review.
+//
+// Backend v5 supports OPTIONAL professional details during registration.
+// These values are preserved through OTP verification and returned in the
+// doctor profile so the doctor does not have to type them a second time.
+// Approval is NOT requested until setup-profile is submitted.
 //
 // Family image:
 // assets/images/signup_family.png
@@ -111,6 +116,9 @@ class SignupData {
   // ==========================================================
   // FLASK REGISTRATION PAYLOAD
   // ==========================================================
+  // The backend supports the optional professional fields here, and
+  // carries them through OTP to the DoctorProfileSetupScreen.
+  // Images, clinic address and years of experience are submitted later.
 
   Map<String, dynamic> toApiJson() {
     final data = <String, dynamic>{
@@ -1474,6 +1482,7 @@ class _SignupScreenState extends State<SignupScreen> {
       'Personal Details',
       'Professional',
       'Email OTP',
+      'Profile Setup',
     ]
         : const [
       'Personal Details',
@@ -1996,11 +2005,12 @@ class _SignupScreenState extends State<SignupScreen> {
                   _info(
                     Icons.info_outline_rounded,
 
-                    'The current backend requires both '
-                        'Medical Registration No. and '
-                        'Registering Council. An NMR ID '
-                        'is additional. Doctor accounts '
-                        'require admin approval after email OTP.',
+                    'Medical Registration No. and Registering Council '
+                        'are required by this form. After email OTP, these '
+                        'professional details will be prefilled in your '
+                        'Doctor Profile Setup. Upload your photo and degree '
+                        'certificate, then submit your completed profile '
+                        'for admin approval.',
                   ),
 
                   const SizedBox(height: 17),
@@ -2047,7 +2057,7 @@ class _SignupScreenState extends State<SignupScreen> {
                         flex: 2,
 
                         child: _primaryButton(
-                          'Send Email OTP',
+                          'Verify Email & Continue',
 
                           _nextProfessional,
                         ),

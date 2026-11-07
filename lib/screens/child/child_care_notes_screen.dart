@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -39,6 +38,9 @@ import '../auth/login_screen.dart';
 // - Authenticated Flask CRUD
 // - Dashboard callback synchronization
 // - Network loading and error handling
+// - Backend v5 doctor-authored records displayed as read-only
+// - Child DOB resolved from profile when not passed by dashboard
+// - Unknown historical observation time is preserved when editing
 //
 // Backend currently supports:
 // title, date, category, notes
@@ -347,6 +349,10 @@ class ChildCareNote {
 
   final bool isPinned;
 
+  // The backend marks clinician-authored notes as DOCTOR_REPORTED.
+  // Family accounts may read but cannot modify or remove such notes.
+  final bool isDoctorAuthored;
+
   // Kept for compatibility with existing dashboard.
   // Current API does not expose audit timestamps.
   final DateTime createdAt;
@@ -365,6 +371,7 @@ class ChildCareNote {
     this.mood,
     this.tags = const [],
     this.isPinned = false,
+    this.isDoctorAuthored = false,
     required this.createdAt,
     required this.updatedAt,
     this.hasRecordedTime = true,
@@ -381,6 +388,7 @@ class ChildCareNote {
       occurredAt: occurredAt,
       tags: List<String>.from(tags),
       isPinned: pinned,
+      isDoctorAuthored: isDoctorAuthored,
       createdAt: createdAt,
       updatedAt: DateTime.now(),
       hasRecordedTime: hasRecordedTime,
@@ -462,7 +470,7 @@ class ChildCareNotesMapper {
       ChildCareNote note,
       ) {
     if (note.title.trim().isEmpty ||
-        note.title.trim().length > 160) {
+        note.title.trim().runes.length > 160) {
       throw const ChildCareNotesApiException(
         'Note title must be between 1 and 160 characters.',
       );
@@ -476,7 +484,9 @@ class ChildCareNotesMapper {
 
     final encoded = encodeDetails(note);
 
-    if (encoded.length > 2000) {
+    // Pydantic max_length counts Unicode code points, not Dart's
+    // UTF-16 string units. Keep length checks consistent with Flask.
+    if (encoded.runes.length > 2000) {
       throw const ChildCareNotesApiException(
         'The note and its metadata exceed the '
             '2000-character backend limit. '
@@ -558,6 +568,10 @@ class ChildCareNotesMapper {
       occurredAt: occurredAt,
       tags: tags,
       isPinned: pinned,
+      isDoctorAuthored:
+      (json['source_role'] ?? '').toString().toUpperCase() ==
+          'DOCTOR' ||
+          (json['verification_status'] ?? '') == 'DOCTOR_REPORTED',
       createdAt: occurredAt,
       updatedAt: occurredAt,
       hasRecordedTime: recordedTime.isNotEmpty,
@@ -604,6 +618,27 @@ class _ChildCareNotesApi {
 
   String notePath(String noteId) {
     return '$notesPath/${Uri.encodeComponent(noteId)}';
+  }
+
+  String get profilePath =>
+      '/api/v1/patients/profiles/${Uri.encodeComponent(profileId)}';
+
+  Future<DateTime?> getChildDateOfBirth() async {
+    final data = await request('GET', profilePath);
+    final raw = data['profile'];
+    if (raw is! Map || raw['module'] != 'child') {
+      throw const ChildCareNotesApiException(
+        'The selected child profile could not be verified.',
+      );
+    }
+
+    final dob = DateTime.tryParse((raw['date_of_birth'] ?? '').toString());
+    if (dob == null) {
+      throw const ChildCareNotesApiException(
+        'Child date of birth is unavailable in the profile.',
+      );
+    }
+    return DateUtils.dateOnly(dob);
   }
 
   void dispose() {
@@ -877,6 +912,7 @@ class _ChildCareNotesScreenState
   late _ChildCareNotesApi _api;
 
   List<ChildCareNote> _notes = [];
+  DateTime? _resolvedChildDateOfBirth;
 
   ChildCareNoteCategory? _selectedCategory;
 
@@ -925,6 +961,7 @@ class _ChildCareNotesScreenState
       baseUrl: _baseUrl,
       profileId: widget.profileId,
     );
+    _resolvedChildDateOfBirth = widget.childDateOfBirth;
 
     _searchController.addListener(
       _onSearchChanged,
@@ -955,6 +992,7 @@ class _ChildCareNotesScreenState
       );
 
       _notes = [];
+      _resolvedChildDateOfBirth = widget.childDateOfBirth;
 
       _selectedCategory = null;
       _dateFilter = ChildCareNotesDateFilter.all;
@@ -966,6 +1004,9 @@ class _ChildCareNotesScreenState
       _loadError = null;
 
       _loadNotes();
+    } else if (oldWidget.childDateOfBirth != widget.childDateOfBirth &&
+        widget.childDateOfBirth != null) {
+      _resolvedChildDateOfBirth = widget.childDateOfBirth;
     }
   }
 
@@ -1063,6 +1104,21 @@ class _ChildCareNotesScreenState
     try {
       final records = await api.getNotes();
 
+      // Dashboard can open this screen without passing child DOB.
+      // Resolve it from the same authorized Flask child profile so
+      // that date validation is applied consistently in the editor.
+      DateTime? fetchedDob =
+          widget.childDateOfBirth ?? _resolvedChildDateOfBirth;
+      if (fetchedDob == null) {
+        try {
+          fetchedDob = await api.getChildDateOfBirth();
+        } catch (_) {
+          // The diary itself remains accessible if profile metadata
+          // is temporarily unavailable. The backend still checks
+          // the child's DOB before persisting a record.
+        }
+      }
+
       if (!mounted ||
           generation != _generation ||
           profileId != widget.profileId) {
@@ -1071,6 +1127,7 @@ class _ChildCareNotesScreenState
 
       setState(() {
         _notes = records;
+        _resolvedChildDateOfBirth = fetchedDob;
         _loading = false;
         _loadError = null;
       });
@@ -1108,6 +1165,11 @@ class _ChildCareNotesScreenState
     if (_saving || _loading || _loadError != null) {
       return;
     }
+    if (existing?.isDoctorAuthored == true) {
+      _showMessage('Doctor-authored notes are read-only for family accounts.',
+          error: true);
+      return;
+    }
 
     final profileId = widget.profileId;
     final api = _api;
@@ -1122,7 +1184,7 @@ class _ChildCareNotesScreenState
         return _ChildCareNoteEditor(
           profileId: profileId,
           childName: widget.childName,
-          childDateOfBirth: widget.childDateOfBirth,
+          childDateOfBirth: _resolvedChildDateOfBirth,
           existing: existing,
         );
       },
@@ -1191,6 +1253,11 @@ class _ChildCareNotesScreenState
     if (_saving || _loading || _loadError != null) {
       return;
     }
+    if (note.isDoctorAuthored) {
+      _showMessage('Doctor-authored notes cannot be pinned or edited here.',
+          error: true);
+      return;
+    }
 
     final profileId = widget.profileId;
     final api = _api;
@@ -1245,6 +1312,11 @@ class _ChildCareNotesScreenState
 
   Future<void> _deleteNote(ChildCareNote note) async {
     if (_saving || _loading || _loadError != null) {
+      return;
+    }
+    if (note.isDoctorAuthored) {
+      _showMessage('Doctor-authored notes cannot be deleted by family accounts.',
+          error: true);
       return;
     }
 
@@ -2262,8 +2334,10 @@ class _ChildCareNotesScreenState
               ),
 
               PopupMenuButton<String>(
-                tooltip: 'Note Actions',
-                enabled: !_saving,
+                tooltip: note.isDoctorAuthored
+                    ? 'Doctor-recorded: view only'
+                    : 'Note Actions',
+                enabled: !_saving && !note.isDoctorAuthored,
                 onSelected: (action) {
                   if (action == 'edit') {
                     _openNoteEditor(existing: note);
@@ -2327,6 +2401,11 @@ class _ChildCareNotesScreenState
                   'Pinned',
                   ChildCareNotesColors.orange,
                 ),
+              if (note.isDoctorAuthored)
+                _noteTag(
+                  'Doctor-recorded • Read-only',
+                  ChildCareNotesColors.green,
+                ),
             ],
           ),
 
@@ -2385,7 +2464,7 @@ class _ChildCareNotesScreenState
                 tooltip: note.isPinned
                     ? 'Unpin note'
                     : 'Pin note',
-                onPressed: _saving
+                onPressed: _saving || note.isDoctorAuthored
                     ? null
                     : () => _togglePin(note),
                 icon: Icon(
@@ -2401,7 +2480,7 @@ class _ChildCareNotesScreenState
               const Spacer(),
 
               TextButton.icon(
-                onPressed: _saving
+                onPressed: _saving || note.isDoctorAuthored
                     ? null
                     : () => _openNoteEditor(
                   existing: note,
@@ -2414,7 +2493,7 @@ class _ChildCareNotesScreenState
               ),
 
               TextButton.icon(
-                onPressed: _saving
+                onPressed: _saving || note.isDoctorAuthored
                     ? null
                     : () => _deleteNote(note),
                 icon: const Icon(
@@ -2736,6 +2815,7 @@ class _ChildCareNoteEditorState
 
   late DateTime _selectedDate;
   late TimeOfDay _selectedTime;
+  late bool _recordTime;
 
   late bool _isPinned;
 
@@ -2779,6 +2859,7 @@ class _ChildCareNoteEditorState
     existing != null && existing.hasRecordedTime
         ? TimeOfDay.fromDateTime(occurredAt)
         : TimeOfDay.fromDateTime(now);
+    _recordTime = existing?.hasRecordedTime ?? true;
 
     _isPinned = existing?.isPinned ?? false;
   }
@@ -2855,6 +2936,7 @@ class _ChildCareNoteEditorState
 
     setState(() {
       _selectedTime = selected;
+      _recordTime = true;
     });
   }
 
@@ -2873,7 +2955,7 @@ class _ChildCareNoteEditorState
       return 'Enter at least 3 characters.';
     }
 
-    if (title.length > 160) {
+    if (title.runes.length > 160) {
       return 'Maximum 160 characters allowed.';
     }
 
@@ -2966,7 +3048,8 @@ class _ChildCareNoteEditorState
 
     final now = DateTime.now();
 
-    if (occurredAt.isAfter(now)) {
+    if ((_recordTime && occurredAt.isAfter(now)) ||
+        (!_recordTime && _selectedDate.isAfter(DateUtils.dateOnly(now)))) {
       _showError(
         'Care note date and time cannot be in the future.',
       );
@@ -3000,7 +3083,7 @@ class _ChildCareNoteEditorState
       isPinned: _isPinned,
       createdAt: widget.existing?.createdAt ?? now,
       updatedAt: now,
-      hasRecordedTime: true,
+      hasRecordedTime: _recordTime,
     );
 
     // Validate the actual encoded backend payload.
@@ -3366,23 +3449,46 @@ class _ChildCareNoteEditorState
         final dateField = _dateField();
         final timeField = _timeField();
 
-        if (wide) {
-          return Row(
-            crossAxisAlignment:
-            CrossAxisAlignment.start,
-            children: [
-              Expanded(child: dateField),
-              const SizedBox(width: 15),
-              Expanded(child: timeField),
-            ],
-          );
-        }
-
-        return Column(
+        // A legacy note may have a date but no recorded time. Do not
+        // invent a time merely because someone edits its text later.
+        final fields = wide && _recordTime
+            ? Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(child: dateField),
+            const SizedBox(width: 15),
+            Expanded(child: timeField),
+          ],
+        )
+            : Column(
           children: [
             dateField,
-            const SizedBox(height: 17),
-            timeField,
+            if (_recordTime) ...[
+              const SizedBox(height: 17),
+              timeField,
+            ],
+          ],
+        );
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            fields,
+            const SizedBox(height: 5),
+            CheckboxListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              value: _recordTime,
+              title: const Text('Include observation time',
+                  style: TextStyle(fontSize: 12)),
+              subtitle: const Text(
+                'Uncheck if the exact time was not recorded.',
+                style: TextStyle(fontSize: 10),
+              ),
+              controlAffinity: ListTileControlAffinity.leading,
+              onChanged: (value) =>
+                  setState(() => _recordTime = value ?? false),
+            ),
           ],
         );
       },

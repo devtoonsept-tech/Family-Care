@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -9,6 +8,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 
 import 'signup_screen.dart';
+import '../doctor/doctor_dashboard_screen.dart';
+import '../doctor/doctor_profile_setup_screen.dart';
 
 // ============================================================
 // FAMILYCARE+ LOGIN SCREEN
@@ -21,8 +22,16 @@ import 'signup_screen.dart';
 // Doctor Login:
 // POST /api/v1/doctors/login
 //
-// Doctor Approval:
-// POST /api/v1/doctors/approval-status
+// Doctor login returns:
+//   202 PROFILE_REQUIRED/REJECTED -> setup token + profile form
+//   202 PENDING_APPROVAL -> limited dashboard, NO access token
+//   200 APPROVED -> secure session + full dashboard
+// POST /api/v1/doctors/approval-status (fallback for restricted states)
+// GET /api/v1/doctors/me (approved: fetch authoritative profile)
+//
+// IMPORTANT: A setup token is NOT a doctor access token.
+// PENDING_APPROVAL never receives a clinical session.
+// The existing FamilyCareSession API is preserved for all app screens.
 //
 // Hero:
 // assets/images/login_family.png
@@ -504,156 +513,415 @@ class _LoginScreenState extends State<LoginScreen> {
       _inlineError = null;
     });
 
-    final valid =
-        _formKey.currentState?.validate() ?? false;
-
-    if (!valid) return;
+    if (!(_formKey.currentState?.validate() ?? false)) {
+      return;
+    }
 
     FocusManager.instance.primaryFocus?.unfocus();
-
     final role = _selectedRole;
-
     final email =
     _emailController.text.trim().toLowerCase();
-
     final password = _passwordController.text;
 
-    setState(() {
-      _loading = true;
-    });
+    setState(() => _loading = true);
 
     try {
-      // ======================================================
-      // PATIENT / DOCTOR LOGIN ENDPOINT
-      // ======================================================
-
       final path = role == LoginRole.doctor
           ? '/api/v1/doctors/login'
           : '/api/v1/patients/login';
 
-      final data = await _post(
-        path,
-        {
-          'email': email,
-          'password': password,
-        },
-      );
-
-      // ======================================================
-      // EXTRACT BACKEND SESSION
-      // ======================================================
-
-      final access = data['access_token'];
-      final refresh = data['refresh_token'];
-      final user = data['user'];
-      final expiresIn = data['expires_in'];
-
-      final expectedRole = role == LoginRole.doctor
-          ? 'DOCTOR'
-          : 'PATIENT';
-
-      // ======================================================
-      // VALIDATE SESSION
-      // ======================================================
-
-      if (access is! String ||
-          access.trim().isEmpty ||
-          refresh is! String ||
-          refresh.trim().isEmpty ||
-          user is! Map ||
-          user['id'] is! String ||
-          (user['id'] as String).trim().isEmpty ||
-          expiresIn is! num ||
-          expiresIn <= 0) {
-        throw const LoginApiException(
-          statusCode: 0,
-          code: 'invalid_session',
-          message:
-          'The server did not return a valid login session.',
-        );
-      }
-
-      // ======================================================
-      // VERIFY ACCOUNT ROLE
-      // ======================================================
-
-      final backendRole = (user['role'] ?? '')
-          .toString()
-          .toUpperCase();
-
-      if (backendRole != expectedRole) {
-        throw const LoginApiException(
-          statusCode: 0,
-          code: 'role_mismatch',
-          message:
-          'Account type does not match your selected role.',
-        );
-      }
-
-      // ======================================================
-      // SECURE SESSION STORAGE
-      // ======================================================
-
-      await FamilyCareSession.save(
-        accessToken: access,
-        refreshToken: refresh,
-        role: expectedRole,
-        userId: user['id'] as String,
-        email: email,
-        expiresIn: expiresIn.toInt(),
-      );
-
+      final data = await _post(path, {
+        'email': email,
+        'password': password,
+      });
       if (!mounted) return;
 
-      _passwordController.clear();
-
-      TextInput.finishAutofillContext();
-
-      // ======================================================
-      // SUCCESS NAVIGATION
-      // ======================================================
-
-      if (widget.onLoginSuccess != null) {
-        widget.onLoginSuccess!(
-          context,
-          role,
-        );
-      } else {
-        final route = role == LoginRole.doctor
-            ? '/doctor-dashboard'
-            : '/patient-dashboard';
-
-        Navigator.of(context).pushNamedAndRemoveUntil(
-          route,
-              (_) => false,
+      // The backend can return a separate mandatory-password-change
+      // challenge. It is not a valid patient or doctor session.
+      if (data['requires_password_change'] == true) {
+        throw const LoginApiException(
+          statusCode: 202,
+          code: 'password_change_required',
+          message:
+          'This account requires a password update before sign-in. '
+              'Use password recovery or contact your administrator.',
         );
       }
-    } on LoginApiException catch (error) {
-      // ======================================================
-      // DOCTOR RESTRICTED ACCOUNT
-      // ======================================================
 
+      // A doctor login can legitimately succeed with HTTP 202
+      // and NO access/refresh token.
+      if (role == LoginRole.doctor) {
+        await _handleDoctorLogin(data, email);
+      } else {
+        await _saveApprovedSession(
+          data,
+          role: LoginRole.patient,
+          email: email,
+        );
+
+        if (!mounted) return;
+
+        _passwordController.clear();
+        TextInput.finishAutofillContext();
+
+        if (widget.onLoginSuccess != null) {
+          widget.onLoginSuccess!(
+            context,
+            LoginRole.patient,
+          );
+        } else {
+          Navigator.of(context).pushNamedAndRemoveUntil(
+            '/patient-dashboard',
+                (route) => false,
+          );
+        }
+      }
+    } on LoginApiException catch (error) {
       if (role == LoginRole.doctor &&
           error.statusCode == 403 &&
           error.code == 'account_restricted') {
-        await _checkDoctorApproval(
-          email,
-          password,
-        );
+        await _checkDoctorApproval(email, password);
       } else {
         _showError(error.message);
       }
     } catch (error) {
-      _showError(
-        _errorMessage(error),
-      );
+      _showError(_errorMessage(error));
     } finally {
       if (mounted) {
-        setState(() {
-          _loading = false;
-        });
+        setState(() => _loading = false);
       }
     }
+  }
+
+  // ==========================================================
+  // SECURE SESSION: PATIENT OR APPROVED DOCTOR ONLY
+  // ==========================================================
+
+  Future<void> _saveApprovedSession(
+      Map<String, dynamic> data, {
+        required LoginRole role,
+        required String email,
+      }) async {
+    final user = _asMap(data['user']);
+    final expectedRole =
+    role == LoginRole.doctor ? 'DOCTOR' : 'PATIENT';
+    final access = data['access_token'];
+    final refresh = data['refresh_token'];
+    final expires = data['expires_in'];
+    final id = user['id'];
+
+    if (access is! String ||
+        access.trim().isEmpty ||
+        refresh is! String ||
+        refresh.trim().isEmpty ||
+        id is! String ||
+        id.trim().isEmpty ||
+        expires is! num ||
+        expires <= 0) {
+      throw const LoginApiException(
+        statusCode: 0,
+        code: 'invalid_session',
+        message:
+        'The server did not return a valid login session.',
+      );
+    }
+
+    if (_value(user['role']).toUpperCase() !=
+        expectedRole) {
+      throw const LoginApiException(
+        statusCode: 0,
+        code: 'role_mismatch',
+        message:
+        'Account type does not match the selected login role.',
+      );
+    }
+
+    if (_value(user['account_status']).toUpperCase() !=
+        'ACTIVE' ||
+        user['email_verified'] != true) {
+      throw const LoginApiException(
+        statusCode: 403,
+        code: 'account_ineligible',
+        message:
+        'An active, email-verified account is required.',
+      );
+    }
+
+    if (role == LoginRole.doctor &&
+        _value(user['approval_status']).toUpperCase() !=
+            'APPROVED') {
+      throw const LoginApiException(
+        statusCode: 403,
+        code: 'not_approved',
+        message:
+        'A doctor session requires verified admin approval.',
+      );
+    }
+
+    await FamilyCareSession.save(
+      accessToken: access,
+      refreshToken: refresh,
+      role: expectedRole,
+      userId: id,
+      email: email,
+      expiresIn: expires.toInt(),
+    );
+  }
+
+  static Map<String, dynamic> _asMap(dynamic value) =>
+      value is Map
+          ? Map<String, dynamic>.from(value)
+          : <String, dynamic>{};
+
+  static String _value(dynamic value) =>
+      (value ?? '').toString().trim();
+
+  // ==========================================================
+  // APPROVED DOCTOR PROFILE (BACKEND V7)
+  // ==========================================================
+  // POST /doctors/login returns session tokens and a user object,
+  // but not the full doctor profile. GET /doctors/me returns
+  // user.doctor including professional details and images.
+  //
+  // Do not trust a setup token here. Always use the approved
+  // bearer session saved by _saveApprovedSession.
+
+  Future<Map<String, dynamic>> _readApprovedDoctor() async {
+    final token =
+    await FamilyCareSession.accessToken();
+
+    if (token == null || token.trim().isEmpty) {
+      throw const LoginApiException(
+        statusCode: 401,
+        code: 'session_missing',
+        message:
+        'Approved doctor session not available. Sign in again.',
+      );
+    }
+
+    final response = await _client
+        .get(
+      Uri.parse('$_baseUrl/api/v1/doctors/me'),
+      headers: {
+        'Authorization': 'Bearer $token',
+        'X-Auth-Transport': 'bearer',
+        'Accept': 'application/json',
+      },
+    )
+        .timeout(const Duration(seconds: 30));
+
+    if (response.statusCode < 200 ||
+        response.statusCode >= 300) {
+      throw LoginApiException(
+        statusCode: response.statusCode,
+        code: 'doctor_profile_unavailable',
+        message: response.statusCode == 401 ||
+            response.statusCode == 403
+            ? 'Doctor session is invalid or approval has changed. '
+            'Sign in again.'
+            : 'Could not verify the doctor profile. Please retry.',
+      );
+    }
+
+    final decoded = jsonDecode(
+      utf8.decode(response.bodyBytes),
+    );
+
+    if (decoded is! Map) {
+      throw const FormatException(
+        'Invalid doctor profile response.',
+      );
+    }
+
+    final data =
+    Map<String, dynamic>.from(decoded);
+    final user = _asMap(data['user']);
+
+    if (_value(user['role']).toUpperCase() !=
+        'DOCTOR' ||
+        _value(user['approval_status']).toUpperCase() !=
+            'APPROVED' ||
+        _value(user['account_status']).toUpperCase() !=
+            'ACTIVE') {
+      throw const LoginApiException(
+        statusCode: 403,
+        code: 'doctor_no_longer_approved',
+        message:
+        'Only approved, active doctors can access the doctor workspace.',
+      );
+    }
+
+    return user;
+  }
+
+  // ==========================================================
+  // DOCTOR HTTP 202 AND HTTP 200 ROUTING
+  // ==========================================================
+
+  Future<void> _handleDoctorLogin(
+      Map<String, dynamic> data,
+      String email,
+      ) async {
+    final user = _asMap(data['user']);
+    final doctor = _asMap(data['doctor']);
+    final status =
+    _value(user['approval_status']).toUpperCase();
+    final role =
+    _value(user['role']).toUpperCase();
+
+    if (role != 'DOCTOR') {
+      throw const LoginApiException(
+        statusCode: 0,
+        code: 'role_mismatch',
+        message: 'This is not a doctor account.',
+      );
+    }
+
+    if (user['email_verified'] != true) {
+      throw const LoginApiException(
+        statusCode: 0,
+        code: 'email_not_verified',
+        message:
+        'Verify your doctor email before signing in.',
+      );
+    }
+
+    if (_value(user['account_status']).toUpperCase() !=
+        'ACTIVE') {
+      throw const LoginApiException(
+        statusCode: 403,
+        code: 'account_restricted',
+        message:
+        'Doctor account is not active. Contact support.',
+      );
+    }
+
+    if (status == 'PROFILE_REQUIRED' ||
+        status == 'REJECTED') {
+      final setupToken =
+      _value(data['setup_token']);
+
+      if (data['requires_profile_setup'] != true ||
+          setupToken.isEmpty) {
+        throw const LoginApiException(
+          statusCode: 0,
+          code: 'missing_setup_token',
+          message:
+          'Doctor setup token is missing. Sign in again.',
+        );
+      }
+
+      // Setup tokens never grant clinical access.
+      await FamilyCareSession.clear();
+      if (!mounted) return;
+
+      _passwordController.clear();
+      TextInput.finishAutofillContext();
+
+      _openDoctorWorkspace(
+        user: user,
+        doctor: doctor,
+        approvalStatus: status,
+        setupToken: setupToken,
+        rejectionReason:
+        _value(data['rejection_reason']),
+        initialShowProfile: true,
+      );
+      return;
+    }
+
+    if (status == 'PENDING_APPROVAL') {
+      if (_value(data['access_token']).isNotEmpty ||
+          _value(data['refresh_token']).isNotEmpty) {
+        throw const LoginApiException(
+          statusCode: 0,
+          code: 'unexpected_session',
+          message:
+          'Unexpected clinical session in pending response.',
+        );
+      }
+
+      await FamilyCareSession.clear();
+      if (!mounted) return;
+
+      _passwordController.clear();
+      TextInput.finishAutofillContext();
+
+      _openDoctorWorkspace(
+        user: user,
+        doctor: doctor,
+        approvalStatus: status,
+        initialShowProfile: false,
+      );
+      return;
+    }
+
+    if (status == 'APPROVED') {
+      await _saveApprovedSession(
+        data,
+        role: LoginRole.doctor,
+        email: email,
+      );
+
+      Map<String, dynamic> freshUser;
+
+      try {
+        freshUser = await _readApprovedDoctor();
+      } catch (_) {
+        // Do not retain an unverified approved session.
+        await FamilyCareSession.clear();
+        rethrow;
+      }
+
+      if (!mounted) return;
+
+      final freshDoctor =
+      _asMap(freshUser['doctor']);
+
+      _passwordController.clear();
+      TextInput.finishAutofillContext();
+
+      _openDoctorWorkspace(
+        user: freshUser,
+        doctor: freshDoctor,
+        approvalStatus: status,
+        initialShowProfile: false,
+      );
+      return;
+    }
+
+    throw LoginApiException(
+      statusCode: 0,
+      code: 'unrecognized_doctor_state',
+      message:
+      'Doctor status "$status" is not available for login.',
+    );
+  }
+
+  void _openDoctorWorkspace({
+    required Map<String, dynamic> user,
+    required Map<String, dynamic> doctor,
+    required String approvalStatus,
+    String? setupToken,
+    String? rejectionReason,
+    required bool initialShowProfile,
+  }) {
+    if (!mounted) return;
+
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => _DoctorLoginWorkspace(
+          apiBaseUrl: _baseUrl,
+          user: user,
+          doctor: doctor,
+          approvalStatus: approvalStatus,
+          setupToken: setupToken,
+          rejectionReason: rejectionReason,
+          initialShowProfile: initialShowProfile,
+        ),
+      ),
+          (route) => false,
+    );
   }
 
   // ==========================================================
@@ -665,7 +933,7 @@ class _LoginScreenState extends State<LoginScreen> {
       String password,
       ) async {
     try {
-      final response = await _post(
+      final data = await _post(
         '/api/v1/doctors/approval-status',
         {
           'email': email,
@@ -675,97 +943,28 @@ class _LoginScreenState extends State<LoginScreen> {
 
       if (!mounted) return;
 
-      final approval =
-      (response['approval_status'] ?? '')
-          .toString()
-          .toUpperCase();
-
-      final account =
-      (response['account_status'] ?? '')
-          .toString()
-          .toUpperCase();
-
       final verified =
-          response['email_verified'] == true;
-
-      // ======================================================
-      // EMAIL NOT VERIFIED
-      // ======================================================
+          data['email_verified'] == true;
+      final account =
+      _value(data['account_status']).toUpperCase();
+      final status =
+      _value(data['approval_status']).toUpperCase();
 
       if (!verified) {
         _showError(
-          'Your email is not verified. '
-              'Complete email verification '
-              'before signing in.',
+          'Your email is not verified. Complete OTP verification.',
         );
-
-        return;
-      }
-
-      // ======================================================
-      // ACCOUNT NOT ACTIVE
-      // ======================================================
-
-      if (account != 'ACTIVE') {
+      } else if (account != 'ACTIVE') {
         _showError(
-          'Your doctor account is not active. '
-              'Contact FamilyCare+ support.',
+          'Your doctor account is not active. Contact support.',
         );
-
-        return;
-      }
-
-      // ======================================================
-      // PENDING APPROVAL
-      // ======================================================
-
-      if (approval == 'PENDING_APPROVAL') {
-        Navigator.of(context).pushNamed(
-          '/doctor-approval-pending',
-          arguments: {
-            'email': email,
-            'approval_status': approval,
-          },
-        );
-
-        return;
-      }
-
-      // ======================================================
-      // REJECTED
-      // ======================================================
-
-      if (approval == 'REJECTED') {
-        final reason =
-        (response['rejection_reason'] ?? '')
-            .toString()
-            .trim();
-
+      } else {
         _showError(
-          reason.isEmpty
-              ? 'Your doctor registration was rejected. '
-              'Contact support.'
-              : 'Doctor registration rejected: $reason',
+          'Doctor status: $status. Please sign in again.',
         );
-
-        return;
       }
-
-      // ======================================================
-      // OTHER RESTRICTIONS
-      // ======================================================
-
-      _showError(
-        approval == 'APPROVED'
-            ? 'Your account could not sign in. '
-            'Please contact support.'
-            : 'Doctor account is not approved '
-            'for sign in.',
-      );
     } catch (error) {
-      _showError(
-        _errorMessage(error),
-      );
+      _showError(_errorMessage(error));
     }
   }
 
@@ -810,45 +1009,33 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: LoginColors.background,
-
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
-            final wide = constraints.maxWidth >= 800;
+            final wide =
+                constraints.maxWidth >= 800;
 
             return SingleChildScrollView(
               keyboardDismissBehavior:
               ScrollViewKeyboardDismissBehavior.onDrag,
-
               padding: EdgeInsets.fromLTRB(
                 wide ? 26 : 14,
                 wide ? 25 : 14,
                 wide ? 26 : 14,
                 28,
               ),
-
               child: Center(
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(
                     maxWidth: 980,
                   ),
-
                   child: Column(
                     crossAxisAlignment:
                     CrossAxisAlignment.stretch,
-
                     children: [
-                      // ======================================
-                      // NAVY + MINT FAMILY HERO
-                      // ======================================
-
                       _familyHero(wide),
 
                       const SizedBox(height: 17),
-
-                      // ======================================
-                      // WHITE LOGIN CARD
-                      // ======================================
 
                       _loginCard(wide),
 
@@ -856,9 +1043,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
                       const Text(
                         'FamilyCare+ • Families. Health. Together.',
-
                         textAlign: TextAlign.center,
-
                         style: TextStyle(
                           color: LoginColors.muted,
                           fontSize: 11,
@@ -878,18 +1063,12 @@ class _LoginScreenState extends State<LoginScreen> {
   // ==========================================================
   // COMPACT HERO CARD
   // ==========================================================
-  //
-  // LEFT: NAVY TEXT
-  // RIGHT: FAMILY PHOTO
-  //
-  // No text overlay on image.
-  //
-  // ==========================================================
 
   Widget _familyHero(bool wide) {
     return LayoutBuilder(
       builder: (context, constraints) {
-        final compact = constraints.maxWidth < 360;
+        final compact =
+            constraints.maxWidth < 360;
 
         final height = wide
             ? 230.0
@@ -897,77 +1076,53 @@ class _LoginScreenState extends State<LoginScreen> {
 
         return ClipRRect(
           borderRadius: BorderRadius.circular(22),
-
           child: SizedBox(
             width: double.infinity,
             height: height,
-
             child: Row(
               crossAxisAlignment:
               CrossAxisAlignment.stretch,
-
               children: [
-                // ============================================
                 // LEFT NAVY SECTION
-                // ============================================
-
                 Expanded(
                   flex: 11,
-
                   child: DecoratedBox(
                     decoration: const BoxDecoration(
                       gradient: LinearGradient(
                         begin: Alignment.topLeft,
                         end: Alignment.bottomRight,
-
                         colors: [
                           LoginColors.deepNavy,
                           LoginColors.navy,
                         ],
                       ),
                     ),
-
                     child: Padding(
                       padding: EdgeInsets.symmetric(
                         horizontal: wide ? 24 : 12,
                         vertical: wide ? 22 : 12,
                       ),
-
                       child: Column(
                         crossAxisAlignment:
                         CrossAxisAlignment.start,
-
                         mainAxisAlignment:
                         MainAxisAlignment.center,
-
                         children: [
-                          // ==================================
-                          // BRAND
-                          // ==================================
-
                           _brandRow(large: wide),
 
                           SizedBox(
                             height: wide ? 25 : 16,
                           ),
 
-                          // ==================================
-                          // HEADING
-                          // ==================================
-
                           Text(
                             'Your Family',
-
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-
                             style: TextStyle(
                               color: Colors.white,
-
                               fontSize: wide
                                   ? 29
                                   : (compact ? 16 : 19),
-
                               fontWeight: FontWeight.w900,
                               height: 1.12,
                             ),
@@ -977,17 +1132,13 @@ class _LoginScreenState extends State<LoginScreen> {
 
                           Text(
                             'Our Priority',
-
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-
                             style: TextStyle(
                               color: LoginColors.mint,
-
                               fontSize: wide
                                   ? 29
                                   : (compact ? 17 : 20),
-
                               fontWeight: FontWeight.w900,
                               height: 1.1,
                             ),
@@ -999,13 +1150,10 @@ class _LoginScreenState extends State<LoginScreen> {
 
                           Text(
                             'Care starts here.',
-
                             maxLines: 2,
                             overflow: TextOverflow.ellipsis,
-
                             style: TextStyle(
                               color: const Color(0xFFD7E9ED),
-
                               fontSize: wide ? 13 : 9,
                               height: 1.35,
                             ),
@@ -1016,25 +1164,17 @@ class _LoginScreenState extends State<LoginScreen> {
                   ),
                 ),
 
-                // ============================================
-                // RIGHT FAMILY + DOCTOR PHOTO
-                // ============================================
-
+                // RIGHT FAMILY IMAGE
                 Expanded(
                   flex: 11,
-
                   child: ColoredBox(
                     color: const Color(0xFFE6F9F4),
-
                     child: Image.asset(
                       _loginFamilyAsset,
-
                       width: double.infinity,
                       height: double.infinity,
-
                       fit: BoxFit.cover,
                       alignment: Alignment.center,
-
                       errorBuilder: (
                           context,
                           error,
@@ -1068,17 +1208,14 @@ class _LoginScreenState extends State<LoginScreen> {
   }) {
     return Row(
       mainAxisSize: MainAxisSize.min,
-
       children: [
         Container(
           width: large ? 38 : 28,
           height: large ? 38 : 28,
-
           decoration: BoxDecoration(
             color: LoginColors.mint,
             borderRadius: BorderRadius.circular(9),
           ),
-
           child: Icon(
             Icons.favorite_rounded,
             color: LoginColors.deepNavy,
@@ -1093,15 +1230,11 @@ class _LoginScreenState extends State<LoginScreen> {
         Flexible(
           child: Text(
             'FamilyCare+',
-
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-
             style: TextStyle(
               color: Colors.white,
-
               fontWeight: FontWeight.w900,
-
               fontSize: large ? 20 : 12,
               letterSpacing: -0.3,
             ),
@@ -1118,20 +1251,15 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget _loginCard(bool wide) {
     return Container(
       width: double.infinity,
-
       padding: EdgeInsets.all(
         wide ? 32 : 19,
       ),
-
       decoration: BoxDecoration(
         color: LoginColors.white,
-
         borderRadius: BorderRadius.circular(26),
-
         border: Border.all(
           color: LoginColors.border,
         ),
-
         boxShadow: const [
           BoxShadow(
             color: Color(0x10102C4B),
@@ -1140,27 +1268,21 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
         ],
       ),
-
       child: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(
             maxWidth: 720,
           ),
-
           child: AutofillGroup(
             child: Form(
               key: _formKey,
-
               autovalidateMode: _submitted
                   ? AutovalidateMode.onUserInteraction
                   : AutovalidateMode.disabled,
-
               child: Column(
                 crossAxisAlignment:
                 CrossAxisAlignment.stretch,
-
                 mainAxisSize: MainAxisSize.min,
-
                 children: [
                   _formHeader(),
 
@@ -1170,10 +1292,6 @@ class _LoginScreenState extends State<LoginScreen> {
 
                   const SizedBox(height: 22),
 
-                  // ========================================
-                  // EMAIL ADDRESS
-                  // ========================================
-
                   _labeledField('Email Address'),
 
                   const SizedBox(height: 8),
@@ -1182,31 +1300,20 @@ class _LoginScreenState extends State<LoginScreen> {
 
                   const SizedBox(height: 17),
 
-                  // ========================================
-                  // PASSWORD
-                  // ========================================
-
                   _labeledField('Password'),
 
                   const SizedBox(height: 8),
 
                   _passwordField(),
 
-                  // ========================================
-                  // FORGOT PASSWORD
-                  // ========================================
-
                   Align(
                     alignment: Alignment.centerRight,
-
                     child: TextButton(
                       onPressed: _loading
                           ? null
                           : _openResetPassword,
-
                       child: const Text(
                         'Forgot password?',
-
                         style: TextStyle(
                           color: LoginColors.navy,
                           fontWeight: FontWeight.w800,
@@ -1215,30 +1322,16 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                   ),
 
-                  // ========================================
-                  // INLINE ERROR
-                  // ========================================
-
                   if (_inlineError != null) ...[
                     const SizedBox(height: 5),
-
                     _errorBox(_inlineError!),
-
                     const SizedBox(height: 14),
                   ] else
                     const SizedBox(height: 9),
 
-                  // ========================================
-                  // LOGIN BUTTON
-                  // ========================================
-
                   _loginButton(),
 
                   const SizedBox(height: 15),
-
-                  // ========================================
-                  // SIGNUP NAVIGATION
-                  // ========================================
 
                   _signupLink(),
 
@@ -1246,9 +1339,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
                   const Text(
                     'Your password is never stored in the app.',
-
                     textAlign: TextAlign.center,
-
                     style: TextStyle(
                       color: LoginColors.muted,
                       fontSize: 10,
@@ -1271,11 +1362,9 @@ class _LoginScreenState extends State<LoginScreen> {
     return Column(
       crossAxisAlignment:
       CrossAxisAlignment.start,
-
       children: [
         const Text(
           'WELCOME TO FAMILYCARE+',
-
           style: TextStyle(
             color: LoginColors.mintDark,
             fontSize: 10,
@@ -1288,7 +1377,6 @@ class _LoginScreenState extends State<LoginScreen> {
 
         const Text(
           'Welcome Back!',
-
           style: TextStyle(
             color: LoginColors.navy,
             fontSize: 25,
@@ -1301,7 +1389,6 @@ class _LoginScreenState extends State<LoginScreen> {
 
         const Text(
           'Sign in to securely manage your family’s health journey.',
-
           style: TextStyle(
             color: LoginColors.muted,
             fontSize: 12,
@@ -1319,7 +1406,6 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget _labeledField(String label) {
     return Text(
       label,
-
       style: const TextStyle(
         color: LoginColors.navy,
         fontWeight: FontWeight.w800,
@@ -1336,7 +1422,6 @@ class _LoginScreenState extends State<LoginScreen> {
     return Column(
       crossAxisAlignment:
       CrossAxisAlignment.start,
-
       children: [
         _labeledField('Sign in as'),
 
@@ -1376,18 +1461,16 @@ class _LoginScreenState extends State<LoginScreen> {
       String label,
       IconData icon,
       ) {
-    final active = _selectedRole == role;
+    final active =
+        _selectedRole == role;
 
     return Material(
       color: active
           ? LoginColors.lightMint
           : const Color(0xFFFAFCFD),
-
       borderRadius: BorderRadius.circular(15),
-
       child: InkWell(
         borderRadius: BorderRadius.circular(15),
-
         onTap: _loading
             ? null
             : () {
@@ -1396,26 +1479,20 @@ class _LoginScreenState extends State<LoginScreen> {
             _inlineError = null;
           });
         },
-
         child: Container(
           height: 92,
-
           decoration: BoxDecoration(
             borderRadius: BorderRadius.circular(15),
-
             border: Border.all(
               color: active
                   ? LoginColors.navy
                   : LoginColors.border,
-
               width: active ? 1.8 : 1,
             ),
           ),
-
           child: Column(
             mainAxisAlignment:
             MainAxisAlignment.center,
-
             children: [
               Icon(
                 icon,
@@ -1427,10 +1504,8 @@ class _LoginScreenState extends State<LoginScreen> {
 
               Text(
                 label,
-
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-
                 style: const TextStyle(
                   color: LoginColors.navy,
                   fontSize: 13,
@@ -1459,7 +1534,6 @@ class _LoginScreenState extends State<LoginScreen> {
         ]) {
       return OutlineInputBorder(
         borderRadius: BorderRadius.circular(14),
-
         borderSide: BorderSide(
           color: color,
           width: width,
@@ -1469,50 +1543,33 @@ class _LoginScreenState extends State<LoginScreen> {
 
     return InputDecoration(
       hintText: hint,
-
       hintStyle: const TextStyle(
         fontSize: 12,
         color: Color(0xFF879DAE),
       ),
-
       prefixIcon: Icon(
         icon,
         color: LoginColors.navy,
         size: 20,
       ),
-
       suffixIcon: suffix,
-
       filled: true,
       fillColor: LoginColors.white,
-
       contentPadding: const EdgeInsets.symmetric(
         horizontal: 15,
         vertical: 17,
       ),
-
-      border: outline(
-        LoginColors.border,
-      ),
-
-      enabledBorder: outline(
-        LoginColors.border,
-      ),
-
+      border: outline(LoginColors.border),
+      enabledBorder: outline(LoginColors.border),
       focusedBorder: outline(
         LoginColors.navy,
         1.8,
       ),
-
-      errorBorder: outline(
-        LoginColors.error,
-      ),
-
+      errorBorder: outline(LoginColors.error),
       focusedErrorBorder: outline(
         LoginColors.error,
         1.5,
       ),
-
       errorMaxLines: 2,
     );
   }
@@ -1524,29 +1581,20 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget _emailField() {
     return TextFormField(
       controller: _emailController,
-
       enabled: !_loading,
-
       keyboardType: TextInputType.emailAddress,
-
       autofillHints: const [
         AutofillHints.username,
         AutofillHints.email,
       ],
-
       textCapitalization:
       TextCapitalization.none,
-
       autocorrect: false,
-
       textInputAction: TextInputAction.next,
-
       onFieldSubmitted: (_) {
         _passwordFocus.requestFocus();
       },
-
       validator: _validateEmail,
-
       decoration: _decoration(
         hint: 'you@example.com',
         icon: Icons.alternate_email_rounded,
@@ -1562,35 +1610,25 @@ class _LoginScreenState extends State<LoginScreen> {
     return TextFormField(
       controller: _passwordController,
       focusNode: _passwordFocus,
-
       enabled: !_loading,
-
       obscureText: !_showPassword,
-
       enableSuggestions: false,
       autocorrect: false,
-
       autofillHints: const [
         AutofillHints.password,
       ],
-
       textInputAction: TextInputAction.done,
-
       onFieldSubmitted: (_) {
         _login();
       },
-
       validator: _validatePassword,
-
       decoration: _decoration(
         hint: 'Enter your password',
         icon: Icons.lock_outline_rounded,
-
         suffix: IconButton(
           tooltip: _showPassword
               ? 'Hide password'
               : 'Show password',
-
           onPressed: _loading
               ? null
               : () {
@@ -1598,12 +1636,10 @@ class _LoginScreenState extends State<LoginScreen> {
               _showPassword = !_showPassword;
             });
           },
-
           icon: Icon(
             _showPassword
                 ? Icons.visibility_outlined
                 : Icons.visibility_off_outlined,
-
             color: LoginColors.navy,
           ),
         ),
@@ -1618,30 +1654,23 @@ class _LoginScreenState extends State<LoginScreen> {
   Widget _errorBox(String message) {
     return Container(
       padding: const EdgeInsets.all(13),
-
       decoration: BoxDecoration(
         color: const Color(0xFFFFF0F2),
-
         borderRadius: BorderRadius.circular(12),
       ),
-
       child: Row(
         crossAxisAlignment:
         CrossAxisAlignment.start,
-
         children: [
           const Icon(
             Icons.error_outline_rounded,
             size: 20,
             color: LoginColors.error,
           ),
-
           const SizedBox(width: 9),
-
           Expanded(
             child: Text(
               message,
-
               style: const TextStyle(
                 color: LoginColors.error,
                 fontSize: 12,
@@ -1662,28 +1691,21 @@ class _LoginScreenState extends State<LoginScreen> {
     return SizedBox(
       width: double.infinity,
       height: 54,
-
       child: FilledButton(
         onPressed: _loading ? null : _login,
-
         style: FilledButton.styleFrom(
           backgroundColor: LoginColors.navy,
-
           disabledBackgroundColor:
           const Color(0xFF7890A3),
-
           foregroundColor: LoginColors.white,
-
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(14),
           ),
         ),
-
         child: _loading
             ? const SizedBox(
           width: 21,
           height: 21,
-
           child: CircularProgressIndicator(
             color: Colors.white,
             strokeWidth: 2,
@@ -1691,22 +1713,17 @@ class _LoginScreenState extends State<LoginScreen> {
         )
             : const Row(
           mainAxisSize: MainAxisSize.min,
-
           mainAxisAlignment:
           MainAxisAlignment.center,
-
           children: [
             Text(
               'Sign In',
-
               style: TextStyle(
                 fontSize: 14,
                 fontWeight: FontWeight.w800,
               ),
             ),
-
             SizedBox(width: 9),
-
             Icon(
               Icons.arrow_forward_rounded,
               size: 19,
@@ -1725,28 +1742,22 @@ class _LoginScreenState extends State<LoginScreen> {
     return Center(
       child: Wrap(
         alignment: WrapAlignment.center,
-
         crossAxisAlignment:
         WrapCrossAlignment.center,
-
         children: [
           const Text(
             "Don't have an account?",
-
             style: TextStyle(
               color: LoginColors.muted,
               fontSize: 12,
             ),
           ),
-
           TextButton(
             onPressed: _loading
                 ? null
                 : _openSignup,
-
             child: const Text(
               'Sign up',
-
               style: TextStyle(
                 color: LoginColors.navy,
                 fontWeight: FontWeight.w800,
@@ -1755,6 +1766,166 @@ class _LoginScreenState extends State<LoginScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+// ============================================================
+// DOCTOR WORKSPACE: PRESERVES ONBOARDING STATE
+// ============================================================
+// Used by LoginScreen for HTTP 202 and 200 doctor responses.
+// No pending/profile-required doctor is given a clinical token.
+// ============================================================
+
+class _DoctorLoginWorkspace extends StatefulWidget {
+  final String apiBaseUrl;
+  final Map<String, dynamic> user;
+  final Map<String, dynamic> doctor;
+  final String approvalStatus;
+  final String? setupToken;
+  final String? rejectionReason;
+  final bool initialShowProfile;
+
+  const _DoctorLoginWorkspace({
+    required this.apiBaseUrl,
+    required this.user,
+    required this.doctor,
+    required this.approvalStatus,
+    required this.initialShowProfile,
+    this.setupToken,
+    this.rejectionReason,
+  });
+
+  @override
+  State<_DoctorLoginWorkspace> createState() =>
+      _DoctorLoginWorkspaceState();
+}
+
+class _DoctorLoginWorkspaceState
+    extends State<_DoctorLoginWorkspace> {
+  late Map<String, dynamic> _user;
+  late Map<String, dynamic> _doctor;
+  late String _approvalStatus;
+  late String _setupToken;
+  late bool _showProfile;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _user = Map<String, dynamic>.from(
+      widget.user,
+    );
+
+    _doctor = Map<String, dynamic>.from(
+      widget.doctor,
+    );
+
+    _approvalStatus = widget.approvalStatus;
+    _setupToken = widget.setupToken ?? '';
+    _showProfile = widget.initialShowProfile;
+  }
+
+  void _showSetup() {
+    setState(() => _showProfile = true);
+  }
+
+  void _showDashboard() {
+    setState(() => _showProfile = false);
+  }
+
+  void _submitted(Map<String, dynamic> response) {
+    final newUser = response['user'];
+
+    if (newUser is Map) {
+      _user = {
+        ..._user,
+        ...Map<String, dynamic>.from(newUser),
+      };
+    }
+
+    final newDoctor = response['doctor'];
+
+    if (newDoctor is Map) {
+      _doctor = {
+        ..._doctor,
+        ...Map<String, dynamic>.from(newDoctor),
+      };
+    }
+
+    setState(() {
+      _approvalStatus = 'PENDING_APPROVAL';
+      _user['approval_status'] = 'PENDING_APPROVAL';
+      _setupToken = '';
+      _showProfile = false;
+    });
+  }
+
+  Future<void> _goToLogin() async {
+    try {
+      await FamilyCareSession.clear();
+    } catch (_) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Could not securely clear the local session. Please retry.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute<void>(
+        builder: (_) => LoginScreen(
+          apiBaseUrl: widget.apiBaseUrl,
+        ),
+      ),
+          (route) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return IndexedStack(
+      index: _showProfile ? 1 : 0,
+      children: [
+        DoctorDashboardScreen(
+          key: ValueKey(
+            'doctor-dashboard-$_approvalStatus',
+          ),
+          doctorName:
+          (_user['full_name'] ?? '').toString(),
+          email: (_user['email'] ?? '').toString(),
+          approvalStatus: _approvalStatus,
+          doctorDetails: _doctor,
+          apiBaseUrl: widget.apiBaseUrl,
+          onOpenProfile: _showSetup,
+          onGoToLogin: () {
+            _goToLogin();
+          },
+        ),
+        DoctorProfileSetupScreen(
+          key: ValueKey(
+            'doctor-profile-$_approvalStatus',
+          ),
+          setupToken: _setupToken.isEmpty
+              ? null
+              : _setupToken,
+          initialUser: _user,
+          initialDoctor: _doctor,
+          approvalStatus: _approvalStatus,
+          rejectionReason:
+          widget.rejectionReason,
+          apiBaseUrl: widget.apiBaseUrl,
+          onSubmitted: _submitted,
+          onBackToDashboard: _showDashboard,
+        ),
+      ],
     );
   }
 }

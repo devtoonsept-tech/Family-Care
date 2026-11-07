@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -13,8 +12,11 @@ import '../auth/login_screen.dart';
 // FAMILYCARE+ - CHILD SETTINGS SCREEN
 // ============================================================
 //
-// GET  /api/v1/patients/profiles/{profileId}
-// POST /api/v1/patients/profiles/{profileId}/connect-doctor
+// GET    /api/v1/patients/profiles/{profileId}
+// PATCH  /api/v1/patients/profiles/{profileId}
+// DELETE /api/v1/patients/profiles/{profileId} (soft removal)
+// POST   /api/v1/patients/profiles/{profileId}/connect-doctor
+// DELETE /api/v1/patients/profiles/{profileId}/doctor
 // GET  /api/v1/patients/profiles/{profileId}/reports
 // GET  /api/v1/children/{childId}/reminders
 // PUT  /api/v1/children/{childId}/reminder-preferences
@@ -22,19 +24,17 @@ import '../auth/login_screen.dart';
 // PUT  /api/v1/children/{childId}/vaccination-context
 //
 // Backend-supported settings:
-// - Child profile details
-// - Guardian and emergency contacts
-// - Doctor connection via referral ID
+// - Child profile view and full edit (member profiles)
+// - Guardian and emergency contacts editor
+// - Doctor connection and disconnection via referral ID
 // - Health report count
 // - In-app reminder preferences
 // - Vaccination email reminders
 // - Contact visibility (UI only)
 //
 // Not implemented in current backend:
-// - Edit/delete child profile
-// - Edit emergency contacts
-// - Disconnect doctor
-// - Change parent connection
+// - Change parent connection (not provided by this backend API)
+// - Permanent erasure of retained records is NOT provided by profile DELETE
 // ============================================================
 
 class ChildSettingsColors {
@@ -182,11 +182,19 @@ class _ChildSettingsApi {
 
       case 'PUT':
         response = await _client
-            .put(
-          uri,
-          headers: headers,
-          body: jsonEncode(body ?? {}),
-        )
+            .put(uri, headers: headers, body: jsonEncode(body ?? {}))
+            .timeout(const Duration(seconds: 35));
+        break;
+
+      case 'PATCH':
+        response = await _client
+            .patch(uri, headers: headers, body: jsonEncode(body ?? {}))
+            .timeout(const Duration(seconds: 35));
+        break;
+
+      case 'DELETE':
+        response = await _client
+            .delete(uri, headers: headers)
             .timeout(const Duration(seconds: 35));
         break;
 
@@ -223,6 +231,20 @@ class _ChildSettingsApi {
 
   Future<Map<String, dynamic>> profile() {
     return request('GET', profilePath);
+  }
+
+  // PATCH requires the *complete* CareProfileUpdate body (not a partial edit).
+  Future<Map<String, dynamic>> updateProfile(Map<String, dynamic> data) {
+    return request('PATCH', profilePath, body: data);
+  }
+
+  // Soft-removes the workspace profile. Retained server data is not erased.
+  Future<Map<String, dynamic>> deleteProfile() {
+    return request('DELETE', profilePath);
+  }
+
+  Future<Map<String, dynamic>> disconnectDoctor() {
+    return request('DELETE', '$profilePath/doctor');
   }
 
   Future<Map<String, dynamic>> connectDoctor(
@@ -333,6 +355,9 @@ class _ChildSettingsScreenState
   bool _vaccinationLoading = true;
 
   bool _connectingDoctor = false;
+  bool _disconnectingDoctor = false;
+  bool _savingProfile = false;
+  bool _deletingProfile = false;
   bool _savingInApp = false;
   bool _savingEmail = false;
 
@@ -365,7 +390,12 @@ class _ChildSettingsScreenState
   }
 
   bool get _anySaveBusy =>
-      _connectingDoctor || _savingInApp || _savingEmail;
+      _connectingDoctor ||
+          _disconnectingDoctor ||
+          _savingProfile ||
+          _deletingProfile ||
+          _savingInApp ||
+          _savingEmail;
 
   bool _stillCurrent(
       int revision,
@@ -414,6 +444,9 @@ class _ChildSettingsScreenState
 
       _showContactDetails = false;
       _connectingDoctor = false;
+      _disconnectingDoctor = false;
+      _savingProfile = false;
+      _deletingProfile = false;
       _savingInApp = false;
       _savingEmail = false;
 
@@ -820,7 +853,7 @@ class _ChildSettingsScreenState
   // ==========================================================
 
   Future<void> _changeInApp(bool newValue) async {
-    if (_savingInApp ||
+    if (_anySaveBusy ||
         _remindersLoading ||
         _inAppReminders == null) {
       return;
@@ -1006,7 +1039,7 @@ class _ChildSettingsScreenState
   Future<void> _changeVaccinationEmail(
       bool newValue,
       ) async {
-    if (_savingEmail ||
+    if (_anySaveBusy ||
         _vaccinationLoading ||
         _emailReminders == null) {
       return;
@@ -1104,7 +1137,7 @@ class _ChildSettingsScreenState
   // ==========================================================
 
   Future<void> _connectDoctor() async {
-    if (_connectingDoctor ||
+    if (_anySaveBusy ||
         _profileLoading ||
         _profile == null ||
         _doctor != null) {
@@ -1165,6 +1198,142 @@ class _ChildSettingsScreenState
           _connectingDoctor = false;
         });
       }
+    }
+  }
+
+  // ==========================================================
+  // EDIT CHILD PROFILE (V5 COMPLETE PATCH)
+  // ==========================================================
+
+  bool get _isMember => _profile?['profile_type'] == 'member';
+
+  Future<void> _editProfile() async {
+    if (_anySaveBusy || _profileLoading || _profile == null || !_isMember) {
+      return;
+    }
+
+    final revision = _revision;
+    final id = widget.profileId;
+    final api = _api;
+    Map<String, dynamic> latest;
+    try {
+      // Get a fresh, complete copy to avoid silently clearing contacts.
+      final response = await api.profile();
+      final raw = response['profile'];
+      if (raw is! Map || raw['id']?.toString() != id || raw['module'] != 'child') {
+        throw const ChildSettingsApiException('Unexpected child profile from server.');
+      }
+      latest = Map<String, dynamic>.from(raw);
+    } catch (error) {
+      if (_stillCurrent(revision, id)) _message(_friendlyError(error), error: true);
+      return;
+    }
+
+    if (!_stillCurrent(revision, id)) return;
+    final edited = await showDialog<Map<String, dynamic>>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _ChildSettingsProfileEditor(profile: latest),
+    );
+    if (edited == null || !_stillCurrent(revision, id) || _anySaveBusy) return;
+
+    setState(() => _savingProfile = true);
+    try {
+      final response = await api.updateProfile(edited);
+      if (!_stillCurrent(revision, id)) return;
+      final raw = response['profile'];
+      if (raw is! Map || raw['id']?.toString() != id || raw['module'] != 'child') {
+        throw const ChildSettingsApiException(
+          'Update was submitted, but the saved profile could not be verified. Refresh before retrying.',
+        );
+      }
+      setState(() { _profile = Map<String, dynamic>.from(raw); _profileError = null; });
+      _message('Child profile and emergency contacts updated.');
+    } catch (error) {
+      if (_stillCurrent(revision, id)) {
+        _message('${_friendlyError(error)} Refresh before retrying.', error: true);
+      }
+    } finally {
+      if (_stillCurrent(revision, id)) setState(() => _savingProfile = false);
+    }
+  }
+
+  // ==========================================================
+  // DISCONNECT DOCTOR (REVOKE LINK FOR THIS CHILD)
+  // ==========================================================
+
+  Future<void> _disconnectDoctor() async {
+    if (_anySaveBusy || _profileLoading || _doctor == null) return;
+    final revision = _revision;
+    final id = widget.profileId;
+    final api = _api;
+    final doctorName = _value(_doctor?['full_name'], fallback: 'this doctor');
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Disconnect Doctor?'),
+        content: Text(
+          'Disconnect $doctorName from this child profile? '
+              'This revokes the doctor connection for this profile. '
+              'Past records and requests are not erased. Any externally '
+              'arranged appointment must be cancelled separately.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Disconnect')),
+        ],
+      ),
+    );
+    if (confirmed != true || !_stillCurrent(revision, id) || _anySaveBusy) return;
+
+    setState(() => _disconnectingDoctor = true);
+    try {
+      final response = await api.disconnectDoctor();
+      if (!_stillCurrent(revision, id)) return;
+      final raw = response['profile'];
+      if (raw is! Map || raw['id']?.toString() != id || raw['module'] != 'child' || raw['doctor'] != null) {
+        throw const ChildSettingsApiException(
+          'Doctor disconnect submitted, but verification was incomplete. Refresh to check.',
+        );
+      }
+      setState(() { _profile = Map<String, dynamic>.from(raw); _profileError = null; });
+      _message('Doctor disconnected from this child profile.');
+    } catch (error) {
+      if (_stillCurrent(revision, id)) _message(_friendlyError(error), error: true);
+    } finally {
+      if (_stillCurrent(revision, id)) setState(() => _disconnectingDoctor = false);
+    }
+  }
+
+  // ==========================================================
+  // DELETE CHILD PROFILE (SOFT REMOVAL, NOT DATA ERASURE)
+  // ==========================================================
+
+  Future<void> _deleteProfile() async {
+    if (_anySaveBusy || _profileLoading || _profile == null || !_isMember) return;
+    final revision = _revision;
+    final id = widget.profileId;
+    final api = _api;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _ChildSettingsDeleteConfirmation(childName: _childName),
+    );
+    if (confirmed != true || !_stillCurrent(revision, id) || _anySaveBusy) return;
+
+    setState(() => _deletingProfile = true);
+    try {
+      await api.deleteProfile();
+      if (!_stillCurrent(revision, id)) return;
+      // Do not silently remove local data or claim permanent server erasure.
+      _message('Child profile removed from your workspace.');
+      Navigator.of(context).pop(true);
+    } catch (error) {
+      if (_stillCurrent(revision, id)) {
+        _message('${_friendlyError(error)} Refresh to verify before retrying.', error: true);
+      }
+    } finally {
+      if (_stillCurrent(revision, id)) setState(() => _deletingProfile = false);
     }
   }
 
@@ -1675,9 +1844,21 @@ class _ChildSettingsScreenState
           const SizedBox(height: 12),
 
           _infoBox(
-            'Child profile details are read-only '
-                'until a profile update API is available.',
+            _isMember
+                ? 'Child details and emergency contacts are saved through the backend. Updating the birth date may be rejected if existing medical records predate it.'
+                : 'Self-profile identity is managed separately and cannot be changed through this child editor.',
           ),
+          if (_isMember) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _anySaveBusy ? null : _editProfile,
+                icon: const Icon(Icons.edit_outlined),
+                label: Text(_savingProfile ? 'Saving Changes...' : 'Edit Child Profile'),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -1700,6 +1881,14 @@ class _ChildSettingsScreenState
 
       child: Column(
         children: [
+          _detailRow(
+            'Guardian Name',
+            _value(_profile?['guardian_name']),
+            icon: Icons.person_outline_rounded,
+          ),
+
+          const Divider(color: ChildSettingsColors.border),
+
           _detailRow(
             'Guardian Phone',
             _privateValue(
@@ -1740,9 +1929,7 @@ class _ChildSettingsScreenState
           const SizedBox(height: 12),
 
           _infoBox(
-            'Guardian details come from the saved '
-                'child profile. Editing them requires '
-                'a backend update API.',
+            'Guardian and emergency contact details are stored in this child profile. Use Edit Child Profile to change them.',
           ),
         ],
       ),
@@ -1761,33 +1948,30 @@ class _ChildSettingsScreenState
       subtitle: 'Important family contact information',
       icon: Icons.contact_emergency_outlined,
 
-      child: contacts.isEmpty
-          ? _emptyInfo(
-        Icons.contact_phone_outlined,
-        'No emergency contacts',
-        'No emergency contacts are saved '
-            'for this profile.',
-      )
-          : Column(
+      child: Column(
         children: [
-          for (int i = 0;
-          i < contacts.length;
-          i++) ...[
-            _emergencyCard(
-              contacts[i],
-              i,
+          if (contacts.isEmpty)
+            _emptyInfo(
+              Icons.contact_phone_outlined,
+              'No emergency contacts',
+              'No emergency contacts are saved for this profile.',
+            )
+          else
+            for (int i = 0; i < contacts.length; i++) ...[
+              _emergencyCard(contacts[i], i),
+              if (i != contacts.length - 1) const SizedBox(height: 11),
+            ],
+          if (_isMember) ...[
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _anySaveBusy ? null : _editProfile,
+                icon: const Icon(Icons.edit_note_outlined),
+                label: const Text('Manage Emergency Contacts'),
+              ),
             ),
-
-            if (i != contacts.length - 1)
-              const SizedBox(height: 11),
           ],
-
-          const SizedBox(height: 12),
-
-          _infoBox(
-            'Adding and editing emergency '
-                'contacts requires a future backend API.',
-          ),
         ],
       ),
     );
@@ -2066,19 +2250,40 @@ class _ChildSettingsScreenState
 
         _detailRow(
           'Approval',
-          _value(
-            doctor['approval_status'],
-          ),
+          _value(doctor['approval_status']),
           icon: Icons.verified_user_outlined,
         ),
+
+        if (_value(doctor['specialization'], fallback: '').isNotEmpty) ...[
+          const Divider(color: ChildSettingsColors.border),
+          _detailRow('Specialty', _value(doctor['specialization']),
+              icon: Icons.stars_outlined),
+        ],
+        if (_value(doctor['qualification'], fallback: '').isNotEmpty) ...[
+          const Divider(color: ChildSettingsColors.border),
+          _detailRow('Qualification', _value(doctor['qualification']),
+              icon: Icons.school_outlined),
+        ],
+        if (_value(doctor['clinic_address'], fallback: '').isNotEmpty) ...[
+          const Divider(color: ChildSettingsColors.border),
+          _detailRow('Clinic', _value(doctor['clinic_address']),
+              icon: Icons.location_on_outlined),
+        ],
 
         const SizedBox(height: 12),
 
         _infoBox(
-          'The linked doctor may access the child '
-              'profile and medical reports according '
-              'to backend permissions. Doctor '
-              'disconnection is not supported yet.',
+          'The linked doctor may access the child profile and medical reports according to backend permissions. Disconnecting revokes this child-profile link but does not delete historical records.',
+        ),
+        const SizedBox(height: 12),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            onPressed: _anySaveBusy ? null : _disconnectDoctor,
+            icon: const Icon(Icons.person_remove_outlined),
+            label: Text(_disconnectingDoctor ? 'Disconnecting...' : 'Disconnect Doctor'),
+            style: OutlinedButton.styleFrom(foregroundColor: ChildSettingsColors.red),
+          ),
         ),
       ],
     );
@@ -2386,65 +2591,34 @@ class _ChildSettingsScreenState
   Widget _futureSettingsSection() {
     return _sectionCard(
       title: 'Profile Management',
-      subtitle: 'Features pending backend support',
+      subtitle: 'Manage this child profile safely',
       icon: Icons.manage_accounts_outlined,
-
       child: Column(
         children: [
           _futureSetting(
-            Icons.edit_note_rounded,
-            'Edit Child Profile',
-            'Name and date-of-birth changes',
-          ),
-
-          const Divider(
-            color: ChildSettingsColors.border,
-          ),
-
-          _futureSetting(
-            Icons.phone_android_outlined,
-            'Update Guardian & Contacts',
-            'Contact information changes',
-          ),
-
-          const Divider(
-            color: ChildSettingsColors.border,
-          ),
-
-          _futureSetting(
             Icons.family_restroom_outlined,
             'Change Parent Connection',
-            'Manage linked parent profiles',
+            'Changing the linked parent profile is not supported by the current backend.',
           ),
-
-          const Divider(
-            color: ChildSettingsColors.border,
-          ),
-
-          _futureSetting(
-            Icons.person_remove_outlined,
-            'Disconnect Doctor',
-            'Revoke doctor profile connection',
-          ),
-
-          const Divider(
-            color: ChildSettingsColors.border,
-          ),
-
-          _futureSetting(
-            Icons.delete_outline_rounded,
-            'Delete Child Profile',
-            'Request removal of child records',
-            color: ChildSettingsColors.red,
-          ),
-
-          const SizedBox(height: 12),
-
-          _infoBox(
-            'These controls are not active because '
-                'their authenticated backend endpoints '
-                'have not been implemented.',
-          ),
+          const Divider(color: ChildSettingsColors.border, height: 28),
+          if (_isMember) ...[
+            const Text(
+              'Removing a child profile hides it and its records from the care workspace. '
+                  'The backend retains private records; this is not a permanent data-erasure request.',
+              style: TextStyle(color: ChildSettingsColors.muted, fontSize: 12, height: 1.5),
+            ),
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _anySaveBusy ? null : _deleteProfile,
+                icon: const Icon(Icons.delete_outline_rounded),
+                label: Text(_deletingProfile ? 'Removing...' : 'Remove Child Profile'),
+                style: OutlinedButton.styleFrom(foregroundColor: ChildSettingsColors.red),
+              ),
+            ),
+          ] else
+            _infoBox('Self profile removal is not supported by this endpoint.'),
         ],
       ),
     );
@@ -2535,10 +2709,7 @@ class _ChildSettingsScreenState
           _privacyItem(
             Icons.medical_services_outlined,
             'Connected Doctor',
-            'The linked doctor can access profile '
-                'and medical reports according to backend '
-                'permissions. Disconnection is not '
-                'currently available.',
+            'The linked doctor can access profile and medical reports according to backend permissions. You can disconnect this doctor from this child profile.',
           ),
 
           const Divider(
@@ -2572,9 +2743,7 @@ class _ChildSettingsScreenState
           _privacyItem(
             Icons.settings_backup_restore_outlined,
             'Future Data Management',
-            'Profile editing, doctor disconnection '
-                'and deletion require additional '
-                'authenticated backend APIs.',
+            'Profile updates, doctor disconnection and profile soft-removal use authenticated backend APIs. Permanent erasure of retained records requires a separate process.',
           ),
         ],
       ),
@@ -3065,4 +3234,303 @@ class _DoctorReferralDialogState
       ],
     );
   }
+}
+
+// ============================================================
+// V5 CHILD PROFILE EDITOR
+// This form always sends all fields required by CareProfileUpdate.
+// ============================================================
+
+class _SettingsEmergencyContact {
+  final TextEditingController name;
+  final TextEditingController phone;
+  final TextEditingController relationship;
+
+  _SettingsEmergencyContact({Map<String, dynamic>? initial})
+      : name = TextEditingController(text: (initial?['name'] ?? '').toString()),
+        phone = TextEditingController(text: (initial?['mobile_number'] ?? '').toString()),
+        relationship = TextEditingController(text: (initial?['relationship'] ?? '').toString());
+
+  Map<String, dynamic> toJson() => {
+    'name': name.text.trim(),
+    'mobile_number': phone.text.trim(),
+    'relationship': relationship.text.trim(),
+  };
+
+  void dispose() {
+    name.dispose();
+    phone.dispose();
+    relationship.dispose();
+  }
+}
+
+class _ChildSettingsProfileEditor extends StatefulWidget {
+  final Map<String, dynamic> profile;
+  const _ChildSettingsProfileEditor({required this.profile});
+
+  @override
+  State<_ChildSettingsProfileEditor> createState() => _ChildSettingsProfileEditorState();
+}
+
+class _ChildSettingsProfileEditorState extends State<_ChildSettingsProfileEditor> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _name;
+  late final TextEditingController _guardianName;
+  late final TextEditingController _guardianContact;
+  final List<_SettingsEmergencyContact> _contacts = [];
+  DateTime? _dob;
+
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: (widget.profile['full_name'] ?? '').toString());
+    _guardianName = TextEditingController(text: (widget.profile['guardian_name'] ?? '').toString());
+    _guardianContact = TextEditingController(text: (widget.profile['guardian_contact'] ?? '').toString());
+    _dob = DateTime.tryParse((widget.profile['date_of_birth'] ?? '').toString());
+    final saved = widget.profile['emergency_contacts'];
+    if (saved is List) {
+      for (final item in saved.take(5)) {
+        if (item is Map) {
+          _contacts.add(_SettingsEmergencyContact(initial: Map<String, dynamic>.from(item)));
+        }
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _guardianName.dispose();
+    _guardianContact.dispose();
+    for (final c in _contacts) { c.dispose(); }
+    super.dispose();
+  }
+
+  DateTime get _today => DateUtils.dateOnly(DateTime.now());
+  String _dateString(DateTime date) =>
+      '${date.year.toString().padLeft(4, '0')}-'
+          '${date.month.toString().padLeft(2, '0')}-'
+          '${date.day.toString().padLeft(2, '0')}';
+
+  String? _requiredName(String? text) {
+    final value = (text ?? '').trim();
+    if (value.isEmpty) return 'Enter a name';
+    if (value.length > 120) return 'Maximum 120 characters';
+    return null;
+  }
+
+  String? _guardianNameValidator(String? text) =>
+      (text ?? '').trim().length > 120 ? 'Maximum 120 characters' : null;
+
+  String? _phoneValidator(String? text, {bool mustProvide = false}) {
+    final value = (text ?? '').trim();
+    if (value.isEmpty && !mustProvide) return null;
+    if (!RegExp(r'^\+?[1-9][0-9]{7,14}$').hasMatch(value)) {
+      return 'Use an international number, e.g. +919876543210';
+    }
+    return null;
+  }
+
+  Future<void> _pickDob() async {
+    final today = _today;
+    final first = DateTime(today.year - 13, today.month, today.day)
+        .add(const Duration(days: 1));
+    final initial = _dob != null && !_dob!.isBefore(first) && !_dob!.isAfter(today)
+        ? _dob! : today;
+    final selected = await showDatePicker(
+      context: context, initialDate: initial, firstDate: first,
+      lastDate: today, helpText: 'CHILD DATE OF BIRTH',
+    );
+    if (mounted && selected != null) setState(() => _dob = selected);
+  }
+
+  void _addContact() {
+    if (_contacts.length < 5) setState(() => _contacts.add(_SettingsEmergencyContact()));
+  }
+
+  void _removeContact(_SettingsEmergencyContact contact) {
+    setState(() => _contacts.remove(contact));
+    // Allow the removed TextFormField to unmount before disposing controllers.
+    WidgetsBinding.instance.addPostFrameCallback((_) => contact.dispose());
+  }
+
+  void _save() {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    final dob = _dob;
+    if (dob == null || dob.isAfter(_today)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Select a valid child date of birth.')),
+      );
+      return;
+    }
+    final years = _today.year - dob.year -
+        ((_today.month < dob.month ||
+            (_today.month == dob.month && _today.day < dob.day)) ? 1 : 0);
+    if (years < 0 || years > 12) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Child Care is for ages 0–12 years.')),
+      );
+      return;
+    }
+    Navigator.pop(context, <String, dynamic>{
+      'full_name': _name.text.trim(),
+      'date_of_birth': _dateString(dob),
+      'guardian_name': _guardianName.text.trim(),
+      'guardian_contact': _guardianContact.text.trim(),
+      'emergency_contacts': _contacts.map((c) => c.toJson()).toList(),
+    });
+  }
+
+  Widget _field(
+      TextEditingController controller, String label, {
+        String? Function(String?)? validator,
+        TextInputType keyboardType = TextInputType.text,
+        int? maxLength,
+      }) => Padding(
+    padding: const EdgeInsets.only(bottom: 13),
+    child: TextFormField(
+      controller: controller,
+      validator: validator,
+      keyboardType: keyboardType,
+      maxLength: maxLength,
+      decoration: InputDecoration(labelText: label, isDense: true,
+          border: const OutlineInputBorder()),
+    ),
+  );
+
+  Widget _contactCard(_SettingsEmergencyContact contact, int index) {
+    return Container(
+      key: ObjectKey(contact),
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        border: Border.all(color: ChildSettingsColors.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(children: [
+        Row(children: [
+          Expanded(child: Text('Emergency Contact ${index + 1}',
+              style: const TextStyle(fontWeight: FontWeight.w700))),
+          IconButton(onPressed: () => _removeContact(contact),
+              tooltip: 'Remove contact',
+              icon: const Icon(Icons.close, color: ChildSettingsColors.red)),
+        ]),
+        _field(contact.name, 'Contact Name', validator: _requiredName, maxLength: 120),
+        _field(contact.relationship, 'Relationship', maxLength: 50,
+            validator: (text) {
+              final value = (text ?? '').trim();
+              if (value.isEmpty) return 'Relationship required';
+              if (value.length > 50) return 'Maximum 50 characters';
+              return null;
+            }),
+        _field(contact.phone, 'Mobile (+country code)', maxLength: 16,
+            keyboardType: TextInputType.phone,
+            validator: (text) => _phoneValidator(text, mustProvide: true)),
+      ]),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+      title: const Text('Edit Child Profile'),
+      content: SizedBox(
+        width: 500,
+        child: SingleChildScrollView(
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Name, DOB, guardian details and all current emergency contacts '
+                    'are saved together. Changing DOB may affect existing medical records.',
+                    style: TextStyle(color: ChildSettingsColors.muted, fontSize: 12)),
+                const SizedBox(height: 18),
+                _field(_name, 'Child Full Name', validator: _requiredName, maxLength: 120),
+                OutlinedButton.icon(
+                  onPressed: _pickDob,
+                  icon: const Icon(Icons.cake_outlined),
+                  label: Text(_dob == null ? 'Select Date of Birth' : _dateString(_dob!)),
+                ),
+                const SizedBox(height: 16),
+                _field(_guardianName, 'Guardian Full Name',
+                    validator: _guardianNameValidator, maxLength: 120),
+                _field(_guardianContact, 'Guardian Mobile (+country code)',
+                    keyboardType: TextInputType.phone,
+                    validator: _phoneValidator, maxLength: 20),
+                const Divider(height: 24),
+                Row(children: [
+                  const Expanded(child: Text('Emergency Contacts',
+                      style: TextStyle(fontWeight: FontWeight.w800))),
+                  TextButton.icon(onPressed: _contacts.length >= 5 ? null : _addContact,
+                      icon: const Icon(Icons.add, size: 17), label: const Text('Add')),
+                ]),
+                if (_contacts.isEmpty)
+                  const Padding(padding: EdgeInsets.all(12),
+                      child: Text('No emergency contacts saved.',
+                          style: TextStyle(color: ChildSettingsColors.muted))),
+                for (int i = 0; i < _contacts.length; i++)
+                  _contactCard(_contacts[i], i),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(onPressed: _save, child: const Text('Save Changes')),
+      ],
+    );
+  }
+}
+
+class _ChildSettingsDeleteConfirmation extends StatefulWidget {
+  final String childName;
+  const _ChildSettingsDeleteConfirmation({required this.childName});
+
+  @override
+  State<_ChildSettingsDeleteConfirmation> createState() => _ChildSettingsDeleteConfirmationState();
+}
+
+class _ChildSettingsDeleteConfirmationState extends State<_ChildSettingsDeleteConfirmation> {
+  final TextEditingController _typed = TextEditingController();
+
+  @override
+  void dispose() { _typed.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: const Text('Remove Child Profile?'),
+    content: Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Remove ${widget.childName} from your FamilyCare+ workspace?'),
+        const SizedBox(height: 13),
+        const Text('The server uses SOFT REMOVAL. The profile and its records become '
+            'unavailable in the care workspace, but private records are retained. '
+            'This is NOT permanent medical-data erasure.',
+            style: TextStyle(color: ChildSettingsColors.red, fontSize: 12)),
+        const SizedBox(height: 14),
+        TextField(
+          controller: _typed,
+          onChanged: (_) => setState(() {}),
+          decoration: const InputDecoration(
+            labelText: 'Type DELETE to confirm',
+            border: OutlineInputBorder(),
+          ),
+        ),
+      ],
+    ),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+      FilledButton(
+        onPressed: _typed.text.trim() == 'DELETE' ? () => Navigator.pop(context, true) : null,
+        style: FilledButton.styleFrom(backgroundColor: ChildSettingsColors.red),
+        child: const Text('Remove Profile'),
+      ),
+    ],
+  );
 }

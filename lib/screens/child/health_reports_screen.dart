@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
@@ -58,7 +57,8 @@ import '../auth/login_screen.dart';
 // - No report-delete API
 // - No automatic source-language detection
 // - No AI report classification/description API
-// - No report metadata edit API
+// - Report category can be edited through Backend v5 PATCH API
+// - No custom report title/date/description persistence API
 // - OCR maximum: 5 PDF pages
 // - English translation uses MyMemory
 //
@@ -104,6 +104,15 @@ enum HealthReportFilter {
 // REPORT MODEL
 // ============================================================
 
+// These values are the exact Backend v5 report-category enum.
+const List<String> _healthReportCategories = <String>[
+  'Lab tests',
+  'Prescriptions',
+  'Scans',
+  'Vaccination',
+  'Others',
+];
+
 class ChildHealthReport {
   final String id;
   final String profileId;
@@ -111,6 +120,10 @@ class ChildHealthReport {
   final String contentType;
   final int sizeBytes;
   final DateTime? createdAt;
+  // Category is persisted server-side; not a diagnosis.
+  final String category;
+  // True only when the account holder explicitly reviewed this category.
+  final bool categoryReviewed;
 
   const ChildHealthReport({
     required this.id,
@@ -119,6 +132,8 @@ class ChildHealthReport {
     required this.contentType,
     required this.sizeBytes,
     required this.createdAt,
+    required this.category,
+    required this.categoryReviewed,
   });
 
   bool get isPdf {
@@ -164,6 +179,10 @@ class ChildHealthReport {
       contentType:
       (json['content_type'] ?? '').toString(),
       sizeBytes: size is num ? size.toInt() : 0,
+      category: _healthReportCategories.contains(json['category'])
+          ? json['category'] as String
+          : 'Others',
+      categoryReviewed: json['category_reviewed'] == true,
       createdAt: rawDate is String
           ? DateTime.tryParse(rawDate)?.toLocal()
           : null,
@@ -453,6 +472,39 @@ class _HealthReportsApi {
     return getJson(
       '$reportsPath?page=$page&per_page=$perPage',
     );
+  }
+
+  // ==========================================================
+  // EXPLICIT REPORT CATEGORY (BACKEND V5)
+  // ==========================================================
+
+  Future<String> saveCategory({
+    required String reportId,
+    required String category,
+  }) async {
+    if (!_healthReportCategories.contains(category)) {
+      throw const HealthReportsApiException(
+        'Please select one of the supported report categories.',
+      );
+    }
+
+    final headers = await _headers();
+    headers['Content-Type'] = 'application/json';
+
+    final response = await _client.patch(
+      Uri.parse('$baseUrl${reportPath(reportId)}/category'),
+      headers: headers,
+      body: jsonEncode({'category': category}),
+    ).timeout(const Duration(seconds: 40));
+
+    final result = _decodeJson(response);
+    if (result['category_reviewed'] != true) {
+      throw const HealthReportsApiException(
+        'The server did not confirm the category review. '
+            'Refresh the report list before trying again.',
+      );
+    }
+    return (result['category'] ?? category).toString();
   }
 
   // ==========================================================
@@ -859,6 +911,7 @@ class _HealthReportsScreenState
 
   HealthReportFilter _filter =
       HealthReportFilter.all;
+  String? _categoryFilter;
 
   static const int _perPage = 20;
 
@@ -953,6 +1006,7 @@ class _HealthReportsScreenState
       _isLoadingMore = false;
 
       _filter = HealthReportFilter.all;
+      _categoryFilter = null;
 
       _searchController.clear();
 
@@ -1227,10 +1281,15 @@ class _HealthReportsScreenState
           !report.isImage) {
         return false;
       }
+      if (_categoryFilter != null &&
+          report.category != _categoryFilter) {
+        return false;
+      }
 
       if (query.isEmpty) return true;
 
-      return report.name.toLowerCase().contains(query);
+      return report.name.toLowerCase().contains(query) ||
+          report.category.toLowerCase().contains(query);
     }).toList();
   }
 
@@ -1246,6 +1305,85 @@ class _HealthReportsScreenState
   // UPLOAD
   // ==========================================================
 
+  // ==========================================================
+  // CHOOSE ONE CANONICAL SERVER CATEGORY
+  // ==========================================================
+
+  Future<String?> _chooseCategory({
+    required String title,
+    String? current,
+  }) async {
+    String? selected = _healthReportCategories.contains(current)
+        ? current
+        : null;
+
+    return showDialog<String>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: Text(title),
+          content: SizedBox(
+            width: 380,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Select what this document is for. The category '
+                      'will be saved to FamilyCare+ and shared with '
+                      'Medical History. It is not a medical diagnosis.',
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.45,
+                    color: HealthReportsColors.muted,
+                  ),
+                ),
+                const SizedBox(height: 15),
+                Wrap(
+                  spacing: 7,
+                  runSpacing: 7,
+                  children: _healthReportCategories.map((category) {
+                    return ChoiceChip(
+                      label: Text(category),
+                      selected: selected == category,
+                      showCheckmark: false,
+                      selectedColor: HealthReportsColors.green,
+                      labelStyle: TextStyle(
+                        fontSize: 11,
+                        color: selected == category
+                            ? Colors.white
+                            : HealthReportsColors.text,
+                      ),
+                      onSelected: (_) {
+                        setDialogState(() => selected = category);
+                      },
+                    );
+                  }).toList(),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: selected == null
+                  ? null
+                  : () => Navigator.pop(dialogContext, selected),
+              child: const Text('Confirm Category'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ==========================================================
+  // UPLOAD AND SAVE CATEGORY AS TWO SEPARATE OPERATIONS
+  // ==========================================================
+
   Future<void> _uploadReport() async {
     if (_busy || _loadingError != null) return;
 
@@ -1256,74 +1394,112 @@ class _HealthReportsScreenState
       final file = await FilePicker.pickFile(
         type: FileType.custom,
         allowedExtensions: const [
-          'pdf',
-          'jpg',
-          'jpeg',
-          'png',
-          'webp',
+          'pdf', 'jpg', 'jpeg', 'png', 'webp',
         ],
         dialogTitle: 'Select Medical Report',
       );
 
-      if (file == null || !mounted) {
-        return;
-      }
-
-      // Never upload a selected file into another
-      // child's profile after a profile switch.
-      if (profileId != widget.profileId) {
-        return;
-      }
-
-      setState(() {
-        _isUploading = true;
-      });
-
-      final savedReport = await api.upload(file);
-
-      if (!mounted ||
+      if (file == null || !mounted ||
           profileId != widget.profileId) {
         return;
       }
 
-      final refreshed = await _refreshReports();
-
-      if (!mounted ||
-          profileId != widget.profileId) {
-        return;
-      }
-
-      _message(
-        refreshed
-            ? 'Medical report uploaded successfully.'
-            : 'Upload accepted by server. '
-            'Refresh to verify your report.',
+      // Do not upload until the user classifies the document.
+      final category = await _chooseCategory(
+        title: 'Report Category',
       );
-
-      // The original report is now available
-      // through the same API used by Medical History.
-      if (refreshed &&
-          savedReport.id.isNotEmpty &&
-          mounted) {
-        _message(
-          'Report saved. You can now read '
-              'or translate its text.',
-        );
+      if (category == null || !mounted ||
+          profileId != widget.profileId) {
+        return;
       }
-    } catch (error) {
-      if (mounted &&
-          profileId == widget.profileId) {
+
+      setState(() => _isUploading = true);
+
+      // A report upload and category PATCH are NOT one transaction.
+      // If PATCH fails, the original file is still uploaded: never
+      // advise retrying upload, which could duplicate the report.
+      final uploaded = await api.upload(file);
+      if (!mounted || profileId != widget.profileId) return;
+
+      String? categoryFailure;
+      try {
+        await api.saveCategory(
+          reportId: uploaded.id,
+          category: category,
+        );
+      } catch (error) {
+        categoryFailure = _friendlyError(error);
+      }
+
+      if (!mounted || profileId != widget.profileId) return;
+      final refreshed = await _refreshReports();
+      if (!mounted || profileId != widget.profileId) return;
+
+      if (categoryFailure != null) {
         _message(
-          _friendlyError(error),
+          'Report uploaded, but category was NOT saved: '
+              '$categoryFailure. Use Edit Category to retry; '
+              'do not upload the file again.',
           error: true,
         );
+      } else if (!refreshed) {
+        _message(
+          'Report and category were submitted to the server, '
+              'but the report list could not refresh. Try Refresh.',
+        );
+      } else {
+        _message('Report uploaded and category saved to FamilyCare+.');
+      }
+    } catch (error) {
+      if (mounted && profileId == widget.profileId) {
+        _message(_friendlyError(error), error: true);
       }
     } finally {
-      if (mounted &&
-          profileId == widget.profileId) {
-        setState(() {
-          _isUploading = false;
-        });
+      if (mounted && profileId == widget.profileId) {
+        setState(() => _isUploading = false);
+      }
+    }
+  }
+
+  // ==========================================================
+  // EDIT CATEGORY OF AN EXISTING UPLOADED REPORT
+  // ==========================================================
+
+  Future<void> _editCategory(ChildHealthReport report) async {
+    if (_busy || _loadingError != null) return;
+
+    final profileId = widget.profileId;
+    final api = _api;
+    final chosen = await _chooseCategory(
+      title: 'Edit Report Category',
+      current: report.category,
+    );
+    if (!mounted || profileId != widget.profileId ||
+        chosen == null) return;
+    if (chosen == report.category && report.categoryReviewed) return;
+
+    setState(() => _isUploading = true);
+    try {
+      final updated = await api.saveCategory(
+        reportId: report.id,
+        category: chosen,
+      );
+      if (!mounted || profileId != widget.profileId) return;
+      final refreshed = await _refreshReports();
+      if (!mounted || profileId != widget.profileId) return;
+      _message(
+        refreshed
+            ? 'Report category saved as $updated.'
+            : 'Category saved, but report list refresh failed. '
+            'Try Refresh.',
+      );
+    } catch (error) {
+      if (mounted && profileId == widget.profileId) {
+        _message(_friendlyError(error), error: true);
+      }
+    } finally {
+      if (mounted && profileId == widget.profileId) {
+        setState(() => _isUploading = false);
       }
     }
   }
@@ -1432,8 +1608,9 @@ class _HealthReportsScreenState
         return;
       }
 
-      // PDFs stored in Cloudinary can be opened
-      // using the short-lived signed URL.
+      // Cloudinary PDFs can open via the short-lived signed URL.
+      // Legacy protected PDFs have no public URL; users must Save.
+      // Never expose bearer tokens in an external PDF viewer URL.
       final uri = await api.pdfUri(report.id);
 
       if (!mounted ||
@@ -2002,9 +2179,11 @@ class _HealthReportsScreenState
           ),
           const SizedBox(height: 13),
           const Text(
-            'Uploaded originals are linked to this '
-                'child profile. The OCR feature reads '
-                'saved reports without re-uploading them.',
+            'The original filename is retained by the server. '
+                'You will select a saved report category before upload. '
+                'Custom titles and report dates cannot be saved until '
+                'dedicated metadata APIs are available. OCR reads '
+                'the saved file without re-uploading it.',
             style: TextStyle(
               color: HealthReportsColors.muted,
               fontSize: 11,
@@ -2091,6 +2270,17 @@ class _HealthReportsScreenState
                   'Images',
                   HealthReportFilter.images,
                 ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 12),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                _reportCategoryChip('All Categories', null),
+                for (final category in _healthReportCategories)
+                  _reportCategoryChip(category, category),
               ],
             ),
           ),
@@ -2188,6 +2378,30 @@ class _HealthReportsScreenState
   }
 
   // ==========================================================
+  // CATEGORY FILTER
+  // ==========================================================
+
+  Widget _reportCategoryChip(String label, String? category) {
+    final selected = _categoryFilter == category;
+    return Padding(
+      padding: const EdgeInsets.only(right: 7),
+      child: ChoiceChip(
+        label: Text(label),
+        selected: selected,
+        showCheckmark: false,
+        selectedColor: HealthReportsColors.green,
+        labelStyle: TextStyle(
+          fontSize: 11,
+          color: selected ? Colors.white : HealthReportsColors.text,
+        ),
+        onSelected: (_) {
+          setState(() => _categoryFilter = category);
+        },
+      ),
+    );
+  }
+
+  // ==========================================================
   // REPORT CARD
   // ==========================================================
 
@@ -2274,7 +2488,30 @@ class _HealthReportsScreenState
                 ),
                 HealthReportsColors.green,
               ),
+              _tag(
+                report.category,
+                HealthReportsColors.purple,
+              ),
             ],
+          ),
+          const SizedBox(height: 7),
+          Text(
+            report.categoryReviewed
+                ? 'Category reviewed and saved by account holder.'
+                : 'Category has not been manually reviewed; '
+                'OCR may automatically organize it.',
+            style: const TextStyle(
+              fontSize: 10,
+              color: HealthReportsColors.muted,
+            ),
+          ),
+          const SizedBox(height: 5),
+          Text(
+            'Listed date is upload date, not the report event date.',
+            style: const TextStyle(
+              fontSize: 10,
+              color: HealthReportsColors.muted,
+            ),
           ),
           const Divider(height: 26),
           Wrap(
@@ -2298,7 +2535,15 @@ class _HealthReportsScreenState
                 ),
               ),
               TextButton.icon(
-                onPressed: () => _openOcr(report),
+                onPressed: _busy ? null : () => _editCategory(report),
+                icon: const Icon(
+                  Icons.edit_outlined,
+                  size: 17,
+                ),
+                label: const Text('Edit Category'),
+              ),
+              TextButton.icon(
+                onPressed: _busy ? null : () => _openOcr(report),
                 icon: const Icon(
                   Icons.translate_rounded,
                   size: 17,
@@ -2340,6 +2585,7 @@ class _HealthReportsScreenState
   Widget _emptyState() {
     final filtered =
         _filter != HealthReportFilter.all ||
+            _categoryFilter != null ||
             _searchController.text.trim().isNotEmpty;
 
     return Container(
@@ -2641,9 +2887,10 @@ class _ReportTextSheetState
   }
 
   String get _displayedText {
-    return _showEnglish
-        ? _englishText
-        : _originalText;
+    if (_showEnglish && _englishText.trim().isNotEmpty) {
+      return _englishText;
+    }
+    return _originalText;
   }
 
   String get _analysisError {

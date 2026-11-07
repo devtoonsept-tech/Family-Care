@@ -96,6 +96,10 @@ class GrowthMeasurementRecord {
   final double? weightKg;
   final String notes;
 
+  // The backend exposes DOCTOR_REPORTED for entries authored by a doctor.
+  // The family must not be shown edit/delete controls for these entries.
+  final bool isDoctorAuthored;
+
   const GrowthMeasurementRecord({
     required this.id,
     required this.profileId,
@@ -103,6 +107,7 @@ class GrowthMeasurementRecord {
     this.heightCm,
     this.weightKg,
     this.notes = '',
+    this.isDoctorAuthored = false,
   });
 
   double? get bmi {
@@ -133,6 +138,8 @@ class GrowthMeasurementRecord {
       heightCm: _number(json['height']),
       weightKg: _number(json['weight']),
       notes: (json['notes'] ?? '').toString(),
+      isDoctorAuthored: json['verification_status'] == 'DOCTOR_REPORTED' ||
+          json['source_role'] == 'DOCTOR',
     );
   }
 
@@ -210,6 +217,7 @@ class NutritionDiaryRecord {
   final String foodDetails;
   final String portion;
   final String notes;
+  final bool isDoctorAuthored;
 
   const NutritionDiaryRecord({
     required this.id,
@@ -219,6 +227,7 @@ class NutritionDiaryRecord {
     required this.foodDetails,
     this.portion = '',
     this.notes = '',
+    this.isDoctorAuthored = false,
   });
 
   factory NutritionDiaryRecord.fromApi(
@@ -241,9 +250,12 @@ class NutritionDiaryRecord {
       date: GrowthDateFormatter.parse(json['date']),
       mealType: type,
       foodDetails: (json['title'] ?? '').toString(),
-      // Temporary backend mapping until portion is added.
+      // Backend v5 retains the free-text portion in its generic category field.
+      // A dedicated portion field should be introduced in a future API version.
       portion: (json['category'] ?? '').toString(),
       notes: (json['notes'] ?? '').toString(),
+      isDoctorAuthored: json['verification_status'] == 'DOCTOR_REPORTED' ||
+          json['source_role'] == 'DOCTOR',
     );
   }
 
@@ -572,6 +584,18 @@ class _GrowthNutritionScreenState
   List<GrowthMeasurementRecord> _growthRecords = [];
   List<NutritionDiaryRecord> _nutritionRecords = [];
 
+  DateTime? _serverChildDateOfBirth;
+  String? _serverChildName;
+
+  DateTime? get _effectiveChildDob =>
+      widget.childDateOfBirth ?? _serverChildDateOfBirth;
+
+  String get _effectiveChildName {
+    final passed = widget.childName.trim();
+    if (passed.isNotEmpty && passed != 'Child') return passed;
+    return _serverChildName ?? 'Child';
+  }
+
   GrowthNutritionTab _selectedTab =
       GrowthNutritionTab.growth;
 
@@ -614,6 +638,7 @@ class _GrowthNutritionScreenState
 
     _nutritionSearch.addListener(_onSearchChanged);
     _loadRecords();
+    _loadChildDetailsIfNeeded();
   }
 
   @override
@@ -634,6 +659,10 @@ class _GrowthNutritionScreenState
 
       _growthRecords = [];
       _nutritionRecords = [];
+      _serverChildDateOfBirth = null;
+      _serverChildName = null;
+      _busy = false;
+      _loadError = null;
 
       _selectedTab = GrowthNutritionTab.growth;
       _selectedMetric = GrowthChartMetric.all;
@@ -642,6 +671,7 @@ class _GrowthNutritionScreenState
 
       _nutritionSearch.clear();
       _loadRecords();
+      _loadChildDetailsIfNeeded();
     }
   }
 
@@ -697,6 +727,43 @@ class _GrowthNutritionScreenState
           content: Text(value),
         ),
       );
+  }
+
+  // ==========================================================
+  // FETCH CHILD DETAILS IF DASHBOARD DID NOT PASS DOB
+  // ==========================================================
+
+  Future<void> _loadChildDetailsIfNeeded() async {
+    if (widget.childDateOfBirth != null &&
+        widget.childName.trim().isNotEmpty &&
+        widget.childName.trim() != 'Child') {
+      return;
+    }
+
+    final profileId = widget.profileId;
+    final api = _api;
+
+    try {
+      final response = await api.request(
+        'GET',
+        '/api/v1/children/${Uri.encodeComponent(profileId)}',
+      );
+      if (!mounted || widget.profileId != profileId || _api != api) return;
+
+      final child = response['child'];
+      if (child is! Map) return;
+
+      final dob = DateTime.tryParse((child['date_of_birth'] ?? '').toString());
+      final name = (child['full_name'] ?? '').toString().trim();
+
+      setState(() {
+        _serverChildDateOfBirth = dob;
+        _serverChildName = name.isEmpty ? null : name;
+      });
+    } catch (_) {
+      // The growth/nutrition APIs remain usable even if this optional
+      // profile lookup fails. The server independently checks record dates.
+    }
   }
 
   // ==========================================================
@@ -773,7 +840,11 @@ class _GrowthNutritionScreenState
 
       setState(() {
         _loading = false;
-        _loadError = _friendlyError(error);
+        // A refresh failure after a confirmed mutation must not hide
+        // already loaded records or disable all editing indefinitely.
+        if (showLoader) {
+          _loadError = _friendlyError(error);
+        }
       });
 
       return false;
@@ -878,7 +949,9 @@ class _GrowthNutritionScreenState
   Future<void> _openGrowthEditor({
     GrowthMeasurementRecord? existing,
   }) async {
-    if (_busy || _loading || _loadError != null) {
+    if (_busy || _loading || _loadError != null) return;
+    if (existing?.isDoctorAuthored == true) {
+      _message('Doctor-entered measurements are read-only.', error: true);
       return;
     }
 
@@ -892,8 +965,8 @@ class _GrowthNutritionScreenState
       backgroundColor: Colors.transparent,
       builder: (context) => _GrowthMeasurementEditor(
         profileId: profileId,
-        childName: widget.childName,
-        childDateOfBirth: widget.childDateOfBirth,
+        childName: _effectiveChildName,
+        childDateOfBirth: _effectiveChildDob,
         existing: existing,
         newRecordId: '',
       ),
@@ -929,10 +1002,12 @@ class _GrowthNutritionScreenState
             ? existing == null
             ? 'Measurement saved to FamilyCare+.'
             : 'Measurement updated successfully.'
-            : 'Measurement submitted. Refresh to verify.',
+            : 'Measurement saved by server; refresh the list to display it.',
       );
     } catch (error) {
-      _message(_friendlyError(error), error: true);
+      if (mounted && profileId == widget.profileId) {
+        _message(_friendlyError(error), error: true);
+      }
     } finally {
       if (mounted && profileId == widget.profileId) {
         setState(() => _busy = false);
@@ -947,7 +1022,9 @@ class _GrowthNutritionScreenState
   Future<void> _openNutritionEditor({
     NutritionDiaryRecord? existing,
   }) async {
-    if (_busy || _loading || _loadError != null) {
+    if (_busy || _loading || _loadError != null) return;
+    if (existing?.isDoctorAuthored == true) {
+      _message('Doctor-entered meal entries are read-only.', error: true);
       return;
     }
 
@@ -961,8 +1038,8 @@ class _GrowthNutritionScreenState
       backgroundColor: Colors.transparent,
       builder: (context) => _NutritionDiaryEditor(
         profileId: profileId,
-        childName: widget.childName,
-        childDateOfBirth: widget.childDateOfBirth,
+        childName: _effectiveChildName,
+        childDateOfBirth: _effectiveChildDob,
         existing: existing,
         newRecordId: '',
       ),
@@ -998,10 +1075,12 @@ class _GrowthNutritionScreenState
             ? existing == null
             ? 'Meal entry saved to FamilyCare+.'
             : 'Meal entry updated successfully.'
-            : 'Meal submitted. Refresh to verify.',
+            : 'Meal saved by server; refresh the list to display it.',
       );
     } catch (error) {
-      _message(_friendlyError(error), error: true);
+      if (mounted && profileId == widget.profileId) {
+        _message(_friendlyError(error), error: true);
+      }
     } finally {
       if (mounted && profileId == widget.profileId) {
         setState(() => _busy = false);
@@ -1049,6 +1128,10 @@ class _GrowthNutritionScreenState
       GrowthMeasurementRecord record,
       ) async {
     if (_busy || _loadError != null) return;
+    if (record.isDoctorAuthored) {
+      _message('Doctor-entered records cannot be deleted.', error: true);
+      return;
+    }
 
     final confirmed = await _confirmDelete(
       'Delete measurement?',
@@ -1077,11 +1160,13 @@ class _GrowthNutritionScreenState
         _message(
           refreshed
               ? 'Measurement deleted.'
-              : 'Deletion submitted. Refresh to verify.',
+              : 'Server confirmed deletion; refresh the list to update it.',
         );
       }
     } catch (error) {
-      _message(_friendlyError(error), error: true);
+      if (mounted && profileId == widget.profileId) {
+        _message(_friendlyError(error), error: true);
+      }
     } finally {
       if (mounted && profileId == widget.profileId) {
         setState(() => _busy = false);
@@ -1093,6 +1178,10 @@ class _GrowthNutritionScreenState
       NutritionDiaryRecord record,
       ) async {
     if (_busy || _loadError != null) return;
+    if (record.isDoctorAuthored) {
+      _message('Doctor-entered records cannot be deleted.', error: true);
+      return;
+    }
 
     final confirmed = await _confirmDelete(
       'Delete meal entry?',
@@ -1121,11 +1210,13 @@ class _GrowthNutritionScreenState
         _message(
           refreshed
               ? 'Meal entry deleted.'
-              : 'Deletion submitted. Refresh to verify.',
+              : 'Server confirmed deletion; refresh the list to update it.',
         );
       }
     } catch (error) {
-      _message(_friendlyError(error), error: true);
+      if (mounted && profileId == widget.profileId) {
+        _message(_friendlyError(error), error: true);
+      }
     } finally {
       if (mounted && profileId == widget.profileId) {
         setState(() => _busy = false);
@@ -1219,6 +1310,13 @@ class _GrowthNutritionScreenState
                       _hero(),
                       const SizedBox(height: 16),
                       _storageNotice(),
+                      if (_busy) ...[
+                        const SizedBox(height: 10),
+                        const LinearProgressIndicator(
+                          color: GrowthNutritionColors.blue,
+                          minHeight: 3,
+                        ),
+                      ],
                       const SizedBox(height: 20),
                       _tabs(),
                       const SizedBox(height: 20),
@@ -1321,7 +1419,7 @@ class _GrowthNutritionScreenState
                 ),
                 const SizedBox(height: 10),
                 Text(
-                  'Track ${widget.childName}\'s growth '
+                  'Track ${_effectiveChildName}\'s growth '
                       'and everyday nutrition.',
                   style: const TextStyle(
                     color: GrowthNutritionColors.muted,
@@ -1997,8 +2095,10 @@ class _GrowthNutritionScreenState
                 ),
               ),
               IconButton(
-                tooltip: 'Edit measurement',
-                onPressed: _busy
+                tooltip: record.isDoctorAuthored
+                    ? 'Doctor-entered record (read-only)'
+                    : 'Edit measurement',
+                onPressed: _busy || record.isDoctorAuthored
                     ? null
                     : () => _openGrowthEditor(
                   existing: record,
@@ -2009,8 +2109,10 @@ class _GrowthNutritionScreenState
                 ),
               ),
               IconButton(
-                tooltip: 'Delete measurement',
-                onPressed: _busy
+                tooltip: record.isDoctorAuthored
+                    ? 'Doctor-entered record (read-only)'
+                    : 'Delete measurement',
+                onPressed: _busy || record.isDoctorAuthored
                     ? null
                     : () => _deleteGrowth(record),
                 icon: const Icon(
@@ -2020,6 +2122,17 @@ class _GrowthNutritionScreenState
               ),
             ],
           ),
+          if (record.isDoctorAuthored) ...[
+            const SizedBox(height: 5),
+            const Text(
+              'Doctor-entered • read-only',
+              style: TextStyle(
+                color: GrowthNutritionColors.purple,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
           const SizedBox(height: 10),
           Wrap(
             spacing: 8,
@@ -2326,8 +2439,10 @@ class _GrowthNutritionScreenState
                 ),
               ),
               IconButton(
-                tooltip: 'Edit meal',
-                onPressed: _busy
+                tooltip: record.isDoctorAuthored
+                    ? 'Doctor-entered record (read-only)'
+                    : 'Edit meal',
+                onPressed: _busy || record.isDoctorAuthored
                     ? null
                     : () => _openNutritionEditor(
                   existing: record,
@@ -2338,8 +2453,10 @@ class _GrowthNutritionScreenState
                 ),
               ),
               IconButton(
-                tooltip: 'Delete meal',
-                onPressed: _busy
+                tooltip: record.isDoctorAuthored
+                    ? 'Doctor-entered record (read-only)'
+                    : 'Delete meal',
+                onPressed: _busy || record.isDoctorAuthored
                     ? null
                     : () => _deleteNutrition(record),
                 icon: const Icon(
@@ -2349,6 +2466,17 @@ class _GrowthNutritionScreenState
               ),
             ],
           ),
+          if (record.isDoctorAuthored) ...[
+            const SizedBox(height: 5),
+            const Text(
+              'Doctor-entered • read-only',
+              style: TextStyle(
+                color: GrowthNutritionColors.purple,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
           const SizedBox(height: 13),
           Text(
             record.foodDetails,
@@ -2666,8 +2794,8 @@ class _GrowthChartPainter extends CustomPainter {
     final graph = Rect.fromLTWH(
       leftMargin,
       12,
-      math.max(1, size.width - leftMargin - 17),
-      math.max(1, size.height - 42),
+      math.max(1.0, size.width - leftMargin - 17),
+      math.max(1.0, size.height - 42),
     );
 
     final gridPaint = Paint()
@@ -2787,10 +2915,10 @@ class _GrowthChartPainter extends CustomPainter {
             : (point.value - minY) / spanY;
 
         final x = graph.left +
-            xRatio.clamp(0.0, 1.0) * graph.width;
+            xRatio.clamp(0.0, 1.0).toDouble() * graph.width;
 
         final y = graph.bottom -
-            yRatio.clamp(0.0, 1.0) * graph.height;
+            yRatio.clamp(0.0, 1.0).toDouble() * graph.height;
 
         if (i == 0) {
           path.moveTo(x, y);
@@ -2821,9 +2949,9 @@ class _GrowthChartPainter extends CustomPainter {
         canvas.drawCircle(
           Offset(
             graph.left +
-                xRatio.clamp(0.0, 1.0) * graph.width,
+                xRatio.clamp(0.0, 1.0).toDouble() * graph.width,
             graph.bottom -
-                yRatio.clamp(0.0, 1.0) * graph.height,
+                yRatio.clamp(0.0, 1.0).toDouble() * graph.height,
           ),
           3.7,
           dotPaint,
@@ -2984,7 +3112,13 @@ class _GrowthMeasurementEditorState
   void _save() {
     setState(() => _submitted = true);
 
-    if (!(_formKey.currentState?.validate() ?? false)) {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+
+    final today = DateUtils.dateOnly(DateTime.now());
+    final birth = widget.childDateOfBirth;
+    if (_date.isAfter(today) ||
+        (birth != null && _date.isBefore(DateUtils.dateOnly(birth)))) {
+      _showError('Measurement date must be between birth and today.');
       return;
     }
 
@@ -3209,7 +3343,15 @@ class _NutritionDiaryEditorState
   void _save() {
     setState(() => _submitted = true);
 
-    if (!(_formKey.currentState?.validate() ?? false)) {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+
+    final today = DateUtils.dateOnly(DateTime.now());
+    final birth = widget.childDateOfBirth;
+    if (_date.isAfter(today) ||
+        (birth != null && _date.isBefore(DateUtils.dateOnly(birth)))) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Meal date must be between birth and today.')),
+      );
       return;
     }
 

@@ -16,21 +16,14 @@ import '../auth/login_screen.dart';
 // FamilyCare+ - Child Medical History
 // ============================================================
 //
-// Current backend integration:
-// - PDF / image upload
-// - Saved reports
-// - Secure original report access
-// - OCR text extraction
-// - Optional English translation with user consent
-//
-// Future backend integration:
-// - Permanent category, title, report date and description
-// - Automatic document language detection
-// - AI-generated description
-// - Report deletion and metadata update
-//
-// Extra report details are session-only until backend
-// metadata APIs are implemented.
+// Backend v5 supports original PDF/image uploads, saved report lists,
+// persistent report category (five canonical categories), signed links,
+// OCR/original/English text and reviewed report -> child history import.
+// User-entered display title, detailed category, report date and description
+// are session-only because backend has no metadata PATCH for those fields.
+// Report deletion is NOT supported by this backend; never fake success.
+// Source language selection is required; no automatic OCR detection yet.
+// Parent-reviewed imports are not doctor-certified diagnoses.
 //
 // Compatible with file_picker 12.x / 13.x.
 // ============================================================
@@ -145,6 +138,14 @@ class MedicalHistoryRecord {
 // REPORT CATEGORIES
 // ============================================================
 
+const List<String> _savedReportCategories = [
+  'Lab tests',
+  'Prescriptions',
+  'Scans',
+  'Vaccination',
+  'Others',
+];
+
 const List<String> _reportCategories = [
   'Blood Test',
   'Urine Test',
@@ -157,6 +158,48 @@ const List<String> _reportCategories = [
   'Consultation',
   'Other',
 ];
+
+// Only these five values are accepted by the backend PATCH category API.
+// Keep the original detailed categories in the UI. Only the broader
+// mapping is saved across devices; display title/date/description are local
+// to this screen session until the backend supplies metadata CRUD.
+String _serverReportCategory(String detailed) {
+  switch (detailed) {
+    case 'Blood Test':
+    case 'Urine Test':
+      return 'Lab tests';
+    case 'X-ray':
+    case 'Ultrasound':
+    case 'MRI / CT Scan':
+      return 'Scans';
+    case 'Prescription':
+      return 'Prescriptions';
+    case 'Vaccination Record':
+      return 'Vaccination';
+    default:
+      return 'Others';
+  }
+}
+
+String _detailFromServerCategory(String category) {
+  switch (category) {
+    case 'Lab tests':
+      return 'Blood Test';
+    case 'Scans':
+      return 'X-ray';
+    case 'Prescriptions':
+      return 'Prescription';
+    case 'Vaccination':
+      return 'Vaccination Record';
+    default:
+      return 'Other';
+  }
+}
+
+String _apiDate(DateTime date) =>
+    '${date.year.toString().padLeft(4, '0')}-'
+        '${date.month.toString().padLeft(2, '0')}-'
+        '${date.day.toString().padLeft(2, '0')}';
 
 // ============================================================
 // OCR LANGUAGES
@@ -226,6 +269,8 @@ class _MedicalReport {
   final String name;
   final String contentType;
   final int sizeBytes;
+  final String category;
+  final bool categoryReviewed;
   final DateTime? uploadedAt;
 
   const _MedicalReport({
@@ -233,8 +278,20 @@ class _MedicalReport {
     required this.name,
     required this.contentType,
     required this.sizeBytes,
+    required this.category,
+    required this.categoryReviewed,
     this.uploadedAt,
   });
+
+  _MedicalReport withCategory(String next) => _MedicalReport(
+    id: id,
+    name: name,
+    contentType: contentType,
+    sizeBytes: sizeBytes,
+    category: next,
+    categoryReviewed: true,
+    uploadedAt: uploadedAt,
+  );
 
   bool get isImage => contentType.startsWith('image/');
 
@@ -252,6 +309,8 @@ class _MedicalReport {
       contentType:
       (json['content_type'] ?? '').toString(),
       sizeBytes: size is num ? size.toInt() : 0,
+      category: (json['category'] ?? 'Others').toString(),
+      categoryReviewed: json['category_reviewed'] == true,
       uploadedAt: _parseDate(json['created_at']),
     );
   }
@@ -450,6 +509,72 @@ class _MedicalReportApi {
   }
 
   // ----------------------------------------------------------
+  // PATCH SAVED REPORT CATEGORY (backend v5)
+  // ----------------------------------------------------------
+
+  Future<String> saveCategory({
+    required String reportId,
+    required String category,
+  }) async {
+    final headers = await _headers();
+    headers['Content-Type'] = 'application/json';
+    final response = await _client.patch(
+      Uri.parse('$baseUrl${reportPath(reportId)}/category'),
+      headers: headers,
+      body: jsonEncode({'category': category}),
+    ).timeout(const Duration(seconds: 35));
+    final data = _decode(response);
+    return (data['category'] ?? category).toString();
+  }
+
+  // ----------------------------------------------------------
+  // IMPORT A MANUALLY REVIEWED REPORT INTO CHILD HISTORY
+  // ----------------------------------------------------------
+
+  Future<bool> importReviewedHistory({
+    required String reportId,
+    required String title,
+    required DateTime date,
+    required String notes,
+  }) async {
+    final data = await post(
+      '${reportPath(reportId)}/import',
+      {
+        'kind': 'history',
+        'reviewed': true,
+        'record': {
+          'title': title,
+          'date': _apiDate(date),
+          'notes': notes,
+          'category': 'Imported medical report',
+        },
+      },
+    );
+    return data['already_imported'] == true;
+  }
+
+  Future<bool> hasImportedHistory(String reportId) async {
+    final path = '/api/v1/patients/profiles/'
+        '${Uri.encodeComponent(profileId)}/imported-records';
+    for (int page = 1; page <= 100; page++) {
+      final response = await get('$path?page=$page&per_page=100');
+      final items = response['items'];
+      if (items is! List) return false;
+      if (items.whereType<Map>().any((entry) =>
+      entry['kind'] == 'history' &&
+          entry['source_report_id']?.toString() == reportId)) {
+        return true;
+      }
+      final total = response['total'];
+      if (items.isEmpty || items.length < 100 ||
+          (total is num && page * 100 >= total)) {
+        break;
+      }
+    }
+    return false;
+  }
+
+  // ----------------------------------------------------------
   // MULTIPART REPORT UPLOAD
   // ----------------------------------------------------------
 
@@ -541,6 +666,64 @@ class _MedicalReportApi {
     }
 
     return reports;
+  }
+
+  // ----------------------------------------------------------
+  // IMPORTED REPORT-BASED HISTORY RECORDS (BACKEND CRUD)
+  // ----------------------------------------------------------
+
+  String get historyPath =>
+      '/api/v1/children/${Uri.encodeComponent(profileId)}/medical-history';
+
+  Future<List<Map<String, dynamic>>> importedHistoryRecords() async {
+    final items = <Map<String, dynamic>>[];
+    final path = '/api/v1/patients/profiles/'
+        '${Uri.encodeComponent(profileId)}/imported-records';
+    for (int page = 1; page <= 100; page++) {
+      final data = await get('$path?page=$page&per_page=100');
+      final pageItems = data['items'];
+      if (pageItems is! List) {
+        throw const _MedicalReportApiException(
+            'Invalid imported history response.');
+      }
+      for (final raw in pageItems) {
+        if (raw is Map && raw['kind'] == 'history') {
+          items.add(Map<String, dynamic>.from(raw));
+        }
+      }
+      final total = data['total'];
+      if (pageItems.isEmpty || pageItems.length < 100 ||
+          (total is num && page * 100 >= total)) break;
+    }
+    return items;
+  }
+
+  Future<void> updateImportedHistory({
+    required String recordId,
+    required String title,
+    required DateTime date,
+    required String notes,
+  }) async {
+    final headers = await _headers();
+    headers['Content-Type'] = 'application/json';
+    final response = await _client.patch(
+      Uri.parse('$baseUrl$historyPath/${Uri.encodeComponent(recordId)}'),
+      headers: headers,
+      body: jsonEncode({
+        'title': title,
+        'date': _apiDate(date),
+        'notes': notes,
+      }),
+    ).timeout(const Duration(seconds: 35));
+    _decode(response);
+  }
+
+  Future<void> deleteImportedHistory(String recordId) async {
+    final response = await _client.delete(
+      Uri.parse('$baseUrl$historyPath/${Uri.encodeComponent(recordId)}'),
+      headers: await _headers(),
+    ).timeout(const Duration(seconds: 35));
+    _decode(response);
   }
 
   // ----------------------------------------------------------
@@ -647,6 +830,11 @@ class _MedicalHistoryScreenState
   late _MedicalReportApi _api;
 
   List<_MedicalReport> _reports = [];
+  List<Map<String, dynamic>> _importedHistory = [];
+  bool _loadingImported = true;
+  bool _savingImported = false;
+  String? _importedError;
+  int _importedGeneration = 0;
 
   // These details are NOT yet stored by Flask.
   final Map<String, _MedicalReportDetails>
@@ -699,6 +887,7 @@ class _MedicalHistoryScreenState
     _searchController.addListener(_onSearchChanged);
 
     _loadReports();
+    _loadImportedHistory();
   }
 
   @override
@@ -719,6 +908,8 @@ class _MedicalHistoryScreenState
       );
 
       _reports = [];
+      _importedHistory = [];
+      _importedGeneration++;
       _sessionDetails.clear();
 
       _selectedCategory = 'All';
@@ -727,12 +918,14 @@ class _MedicalHistoryScreenState
       _searchController.clear();
 
       _loadReports();
+      _loadImportedHistory();
     }
   }
 
   @override
   void dispose() {
     _generation++;
+    _importedGeneration++;
 
     _api.dispose();
 
@@ -834,6 +1027,118 @@ class _MedicalHistoryScreenState
   }
 
   // ==========================================================
+  // LOAD REVIEWED REPORT-BASED HISTORY
+  // ==========================================================
+
+  Future<void> _loadImportedHistory() async {
+    final generation = ++_importedGeneration;
+    final profileId = widget.profileId;
+    if (!mounted) return;
+    setState(() {
+      _loadingImported = true;
+      _importedError = null;
+    });
+    try {
+      final history = await _api.importedHistoryRecords();
+      if (!mounted || generation != _importedGeneration ||
+          widget.profileId != profileId) return;
+      setState(() {
+        _importedHistory = history;
+        _loadingImported = false;
+      });
+    } catch (error) {
+      if (!mounted || generation != _importedGeneration ||
+          widget.profileId != profileId) return;
+      setState(() {
+        _importedError = _friendlyError(error);
+        _loadingImported = false;
+      });
+    }
+  }
+
+  Future<void> _refreshAll() async {
+    await Future.wait<void>([_loadReports(), _loadImportedHistory()]);
+  }
+
+  Future<void> _editImportedHistory(Map<String, dynamic> record) async {
+    if (_savingImported) return;
+    final id = record['id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    if (record['verification_status'] == 'DOCTOR_REPORTED') {
+      _showMessage('Doctor-authored records cannot be changed by parents.',
+          error: true);
+      return;
+    }
+    final edited = await showDialog<_ReviewedHistoryInput>(
+      context: context,
+      builder: (_) => _ReviewedHistoryDialog(
+        initialTitle: (record['title'] ?? '').toString(),
+        initialDate: _parseDate(record['date']),
+        initialNotes: (record['notes'] ?? '').toString(),
+        birthDate: widget.childDateOfBirth,
+      ),
+    );
+    if (edited == null || !mounted) return;
+    setState(() => _savingImported = true);
+    try {
+      await _api.updateImportedHistory(
+        recordId: id,
+        title: edited.title,
+        date: edited.date,
+        notes: edited.notes,
+      );
+      if (!mounted) return;
+      _showMessage('Medical History entry updated in the database.');
+      await _loadImportedHistory();
+    } catch (error) {
+      _showMessage(_friendlyError(error), error: true);
+    } finally {
+      if (mounted) setState(() => _savingImported = false);
+    }
+  }
+
+  Future<void> _deleteImportedHistory(Map<String, dynamic> record) async {
+    if (_savingImported) return;
+    if (record['verification_status'] == 'DOCTOR_REPORTED') {
+      _showMessage('Doctor-authored records cannot be deleted by parents.',
+          error: true);
+      return;
+    }
+    final id = record['id']?.toString() ?? '';
+    if (id.isEmpty) return;
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete imported history entry?'),
+        content: const Text(
+          'The parent-reviewed history entry will be removed. '
+              'The uploaded report itself is retained. '
+              'This same report cannot be re-imported after removal; '
+              'a manual correction may be needed.',
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Delete History Entry')),
+        ],
+      ),
+    );
+    if (shouldDelete != true || !mounted) return;
+    setState(() => _savingImported = true);
+    try {
+      await _api.deleteImportedHistory(id);
+      if (!mounted) return;
+      _showMessage('History entry removed. The report remains available.');
+      await _loadImportedHistory();
+    } catch (error) {
+      _showMessage(_friendlyError(error), error: true);
+    } finally {
+      if (mounted) setState(() => _savingImported = false);
+    }
+  }
+
+  // ==========================================================
   // UPLOAD REPORT
   // ==========================================================
 
@@ -867,36 +1172,43 @@ class _MedicalHistoryScreenState
     setState(() => _saving = true);
 
     try {
-      final report = await _api.upload(
+      final uploaded = await _api.upload(
         fileName: selection.fileName!,
         bytes: selection.bytes!,
       );
 
-      if (!mounted ||
-          widget.profileId != profileId) {
-        return;
+      // A file upload and a category PATCH are separate server operations.
+      // Preserve successful upload even if the latter fails.
+      var report = uploaded;
+      String? categoryFailure;
+      try {
+        final category = await _api.saveCategory(
+          reportId: uploaded.id,
+          category: _serverReportCategory(selection.details.category),
+        );
+        report = uploaded.withCategory(category);
+      } catch (error) {
+        categoryFailure = _friendlyError(error);
       }
 
+      if (!mounted || widget.profileId != profileId) return;
+
       setState(() {
-        _sessionDetails[report.id] =
-            selection.details;
-
-        _reports.removeWhere(
-              (item) => item.id == report.id,
-        );
-
+        _sessionDetails[report.id] = selection.details;
+        _reports.removeWhere((item) => item.id == report.id);
         _reports.insert(0, report);
       });
 
-      _showMessage(
-        'Original report uploaded successfully. '
-            'Custom details are temporary until the '
-            'metadata API is available.',
-      );
+      if (categoryFailure == null) {
+        _showMessage('Report uploaded and category saved. '
+            'Title, date and description are session-only.');
+      } else {
+        _showMessage('Report uploaded, but category was NOT saved: '
+            '$categoryFailure. You can retry using Edit Details.',
+            error: true);
+      }
 
-      if (!mounted) return;
-
-      await _openReport(report);
+      if (mounted) await _openReport(report);
     } catch (error) {
       if (mounted) {
         _showMessage(
@@ -924,7 +1236,7 @@ class _MedicalHistoryScreenState
     final current =
         _sessionDetails[report.id] ??
             _MedicalReportDetails(
-              category: 'Other',
+              category: _detailFromServerCategory(report.category),
               title: report.name,
               description: '',
               reportDate: null,
@@ -945,15 +1257,40 @@ class _MedicalHistoryScreenState
 
     if (!mounted || edited == null) return;
 
+    final profileId = widget.profileId;
+    setState(() => _saving = true);
+    String? categoryFailure;
+    String? savedCategory;
+    try {
+      savedCategory = await _api.saveCategory(
+        reportId: report.id,
+        category: _serverReportCategory(edited.details.category),
+      );
+    } catch (error) {
+      categoryFailure = _friendlyError(error);
+    } finally {
+      if (mounted && widget.profileId == profileId) {
+        setState(() => _saving = false);
+      }
+    }
+
+    if (!mounted || widget.profileId != profileId) return;
     setState(() {
-      _sessionDetails[report.id] =
-          edited.details;
+      _sessionDetails[report.id] = edited.details;
+      if (savedCategory != null) {
+        final index = _reports.indexWhere((item) => item.id == report.id);
+        if (index >= 0) {
+          _reports[index] = _reports[index].withCategory(savedCategory!);
+        }
+      }
     });
 
-    _showMessage(
-      'Report details updated for this app session. '
-          'Database metadata update is not available yet.',
-    );
+    _showMessage(categoryFailure == null
+        ? 'Category saved to the backend. Custom title, detailed type, '
+        'date and description remain session-only.'
+        : 'Custom details saved only for this session. '
+        'Category could not be synced: $categoryFailure',
+        error: categoryFailure != null);
   }
 
   // ==========================================================
@@ -975,6 +1312,8 @@ class _MedicalHistoryScreenState
           api: _api,
           report: report,
           details: _sessionDetails[report.id],
+          childDateOfBirth: widget.childDateOfBirth,
+          onHistoryChanged: _loadImportedHistory,
         );
       },
     );
@@ -991,11 +1330,14 @@ class _MedicalHistoryScreenState
     return _reports.where((report) {
       final details = _sessionDetails[report.id];
 
-      final category =
-          details?.category ?? 'Other';
+      final category = details?.category ?? '';
+      final serverCategory = report.category;
+      // Fine-grained types cannot be reconstructed from the server's
+      // broad category after this screen session ends.
+      final matchesCategory = category == _selectedCategory ||
+          serverCategory == _selectedCategory;
 
-      if (_selectedCategory != 'All' &&
-          category != _selectedCategory) {
+      if (_selectedCategory != 'All' && !matchesCategory) {
         return false;
       }
 
@@ -1005,6 +1347,7 @@ class _MedicalHistoryScreenState
         report.name,
         details?.title ?? '',
         details?.category ?? '',
+        report.category,
         details?.description ?? '',
       ].any(
             (value) =>
@@ -1047,11 +1390,11 @@ class _MedicalHistoryScreenState
         elevation: 0,
         actions: [
           IconButton(
-            tooltip: 'Refresh reports',
+            tooltip: 'Refresh reports and history',
             onPressed:
-            _loading || _saving
+            _loading || _saving || _savingImported
                 ? null
-                : _loadReports,
+                : _refreshAll,
             icon: const Icon(
               Icons.refresh_rounded,
             ),
@@ -1083,7 +1426,7 @@ class _MedicalHistoryScreenState
           ),
         )
             : RefreshIndicator(
-          onRefresh: _loadReports,
+          onRefresh: _refreshAll,
           child: ListView(
             padding: const EdgeInsets.fromLTRB(
               16, 20, 16, 110,
@@ -1110,9 +1453,9 @@ class _MedicalHistoryScreenState
                       _medicalNotice(
                         'Original reports are stored '
                             'through the current backend. '
-                            'Custom title, category, report '
-                            'date and description currently '
-                            'remain in this app session only.',
+                            'Report category is saved through the '
+                            'backend. Custom title, detailed type, '
+                            'date and description are session-only.',
                         MedicalHistoryColors.lightOrange,
                         MedicalHistoryColors.orange,
                       ),
@@ -1128,6 +1471,9 @@ class _MedicalHistoryScreenState
 
                         _buildReportsSection(),
                       ],
+
+                      const SizedBox(height: 20),
+                      _buildImportedHistorySection(),
 
                       const SizedBox(height: 20),
 
@@ -1404,6 +1750,7 @@ class _MedicalHistoryScreenState
             child: Row(
               children: [
                 'All',
+                ..._savedReportCategories,
                 ..._reportCategories,
               ].map((category) {
                 final selected =
@@ -1522,7 +1869,7 @@ class _MedicalHistoryScreenState
                     const SizedBox(height: 5),
 
                     Text(
-                      '${details?.category ?? 'Uncategorized'}'
+                      '${report.category} (saved)'
                           ' • ${_formatSize(report.sizeBytes)}',
                       style: const TextStyle(
                         color: MedicalHistoryColors.muted,
@@ -1574,8 +1921,8 @@ class _MedicalHistoryScreenState
           if (details != null) ...[
             const SizedBox(height: 9),
             const Text(
-              'Custom details are temporary '
-                  '(database API pending).',
+              'Custom title/type/date/description are '
+                  'session-only. Broad category is saved.',
               style: TextStyle(
                 color: MedicalHistoryColors.orange,
                 fontSize: 10,
@@ -1616,7 +1963,7 @@ class _MedicalHistoryScreenState
 
               const Tooltip(
                 message:
-                'Report delete API will be added later.',
+                'Backend v5 has no report delete API. Original file cannot be deleted here.',
                 child: Icon(
                   Icons.delete_outline_rounded,
                   color: MedicalHistoryColors.muted,
@@ -1624,6 +1971,89 @@ class _MedicalHistoryScreenState
               ),
             ],
           ),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================================
+  // BACKEND-IMPORTED PARENT-REVIEWED MEDICAL HISTORY RECORDS
+  // ==========================================================
+
+  Widget _buildImportedHistorySection() {
+    return _medicalPanel(
+      'Reviewed Medical History Entries',
+      Icons.fact_check_outlined,
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Entries created from uploaded reports after manual review. '
+                'The original report remains separate and unchanged.',
+            style: TextStyle(color: MedicalHistoryColors.muted, fontSize: 12),
+          ),
+          const SizedBox(height: 12),
+          if (_loadingImported) const LinearProgressIndicator(),
+          if (_importedError != null) ...[
+            Text('Could not load imported history: $_importedError',
+                style: const TextStyle(color: MedicalHistoryColors.red)),
+            TextButton.icon(onPressed: _loadImportedHistory,
+                icon: const Icon(Icons.refresh_rounded),
+                label: const Text('Retry')),
+          ],
+          if (!_loadingImported && _importedError == null &&
+              _importedHistory.isEmpty)
+            const Text('No reviewed history entries imported yet.',
+                style: TextStyle(color: MedicalHistoryColors.muted)),
+          if (!_loadingImported && _importedError == null)
+            for (final record in _importedHistory) ...[
+              Container(
+                margin: const EdgeInsets.only(bottom: 10),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: MedicalHistoryColors.cream,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: MedicalHistoryColors.border),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text((record['title'] ?? 'Medical history').toString(),
+                        style: const TextStyle(
+                          color: MedicalHistoryColors.navy,
+                          fontWeight: FontWeight.w700,
+                        )),
+                    const SizedBox(height: 5),
+                    Text('Event date: ${_formatDate(_parseDate(record['date']))}'
+                        ' • Parent-reported',
+                        style: const TextStyle(fontSize: 11,
+                            color: MedicalHistoryColors.muted)),
+                    if ((record['notes'] ?? '').toString().trim().isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Text((record['notes'] ?? '').toString(),
+                            style: const TextStyle(fontSize: 12)),
+                      ),
+                    const SizedBox(height: 8),
+                    Wrap(spacing: 8, runSpacing: 4, children: [
+                      TextButton.icon(
+                        onPressed: _savingImported ? null
+                            : () => _editImportedHistory(record),
+                        icon: const Icon(Icons.edit_outlined),
+                        label: const Text('Edit Entry'),
+                      ),
+                      TextButton.icon(
+                        onPressed: _savingImported ? null
+                            : () => _deleteImportedHistory(record),
+                        icon: const Icon(Icons.delete_outline_rounded,
+                            color: MedicalHistoryColors.red),
+                        label: const Text('Delete Entry'),
+                      ),
+                    ]),
+                  ],
+                ),
+              ),
+            ],
         ],
       ),
     );
@@ -2241,7 +2671,8 @@ class _ReportFormSheetState
                   'feature will be connected when the '
                   'new backend API is ready. For now, '
                   'you can enter the description yourself. '
-                  'Custom details are temporary.',
+                  'The broad report category is saved to the backend. '
+                  'Title, detailed type, date and description are session-only.',
               MedicalHistoryColors.lightOrange,
               MedicalHistoryColors.orange,
             ),
@@ -2295,11 +2726,15 @@ class _ReportViewerSheet extends StatefulWidget {
   final _MedicalReportApi api;
   final _MedicalReport report;
   final _MedicalReportDetails? details;
+  final DateTime? childDateOfBirth;
+  final VoidCallback? onHistoryChanged;
 
   const _ReportViewerSheet({
     required this.api,
     required this.report,
     this.details,
+    this.childDateOfBirth,
+    this.onHistoryChanged,
   });
 
   @override
@@ -2321,6 +2756,8 @@ class _ReportViewerSheetState
   bool _processing = false;
   bool _ocrConfigured = false;
   bool _showEnglish = true;
+  bool _importingHistory = false;
+  bool _alreadyImportedHistory = false;
 
   String? _previewUrl;
   String? _errorMessage;
@@ -2431,6 +2868,13 @@ class _ReportViewerSheetState
       }
     } catch (error) {
       _errorMessage = error.toString();
+    }
+
+    try {
+      _alreadyImportedHistory =
+      await widget.api.hasImportedHistory(widget.report.id);
+    } catch (_) {
+      // An unavailable imported-records endpoint must not hide original reports.
     }
 
     if (!mounted) return;
@@ -2612,6 +3056,48 @@ class _ReportViewerSheetState
   }
 
   // ==========================================================
+  // OPT-IN, PARENT-REVIEWED HISTORY IMPORT
+  // ==========================================================
+
+  Future<void> _importHistory() async {
+    if (_importingHistory || _alreadyImportedHistory) return;
+    if (_result['original_text']?.toString().trim().isEmpty ?? true) {
+      _showMessage('First extract and review the original report text.');
+      return;
+    }
+    final input = await showDialog<_ReviewedHistoryInput>(
+      context: context,
+      builder: (_) => _ReviewedHistoryDialog(
+        initialTitle: widget.details?.title ?? widget.report.name,
+        birthDate: widget.childDateOfBirth,
+      ),
+    );
+    if (input == null || !mounted) return;
+    setState(() => _importingHistory = true);
+    try {
+      final exists = await widget.api.importReviewedHistory(
+        reportId: widget.report.id,
+        title: input.title,
+        date: input.date,
+        notes: input.notes,
+      );
+      if (!mounted) return;
+      setState(() => _alreadyImportedHistory = true);
+      widget.onHistoryChanged?.call();
+      _showMessage(exists
+          ? 'This report was already imported into Medical History.'
+          : 'Reviewed history entry saved to this child on the backend. '
+          'It is parent-reported, not a doctor-confirmed diagnosis.');
+    } catch (error) {
+      if (mounted) {
+        _showMessage('History import failed: $error');
+      }
+    } finally {
+      if (mounted) setState(() => _importingHistory = false);
+    }
+  }
+
+  // ==========================================================
   // VIEWER UI
   // ==========================================================
 
@@ -2685,8 +3171,15 @@ class _ReportViewerSheetState
           ),
 
           // --------------------------------------------------
-          // SESSION DETAILS
+          // PERSISTED CATEGORY + SESSION-ONLY DETAILS
           // --------------------------------------------------
+
+          Text('Saved category: ${widget.report.category}',
+              style: const TextStyle(
+                color: MedicalHistoryColors.green,
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+              )),
 
           if (widget.details != null) ...[
             const SizedBox(height: 12),
@@ -2725,7 +3218,7 @@ class _ReportViewerSheetState
             const SizedBox(height: 8),
 
             const Text(
-              'Custom details are session-only.',
+              'Custom title, type, date and description are session-only.',
               style: TextStyle(
                 color: MedicalHistoryColors.orange,
                 fontSize: 10,
@@ -3087,6 +3580,35 @@ class _ReportViewerSheetState
 
           const SizedBox(height: 18),
 
+          if (_alreadyImportedHistory)
+            _medicalNotice(
+              'This report already has a parent-reviewed entry '
+                  'in the child Medical History database.',
+              MedicalHistoryColors.lightGreen,
+              MedicalHistoryColors.green,
+            )
+          else if (originalText.trim().isNotEmpty) ...[
+            OutlinedButton.icon(
+              onPressed: _importingHistory ? null : _importHistory,
+              icon: _importingHistory
+                  ? const SizedBox(
+                width: 17, height: 17,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+                  : const Icon(Icons.fact_check_outlined),
+              label: const Text('Add Reviewed Entry to Medical History'),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'Optional: review the original report and manually enter '
+                  'a title, actual event date and notes. OCR text is not '
+                  'automatically converted into a diagnosis.',
+              style: TextStyle(fontSize: 11, color: MedicalHistoryColors.muted),
+            ),
+          ],
+
+          const SizedBox(height: 18),
+
           _medicalNotice(
             'Automatic language detection and '
                 'AI-generated report descriptions '
@@ -3098,6 +3620,165 @@ class _ReportViewerSheetState
           ),
         ],
       ),
+    );
+  }
+}
+
+// ============================================================
+// REVIEWED REPORT -> HISTORY ENTRY FORM
+// ============================================================
+
+class _ReviewedHistoryInput {
+  final String title;
+  final DateTime date;
+  final String notes;
+
+  const _ReviewedHistoryInput({
+    required this.title,
+    required this.date,
+    required this.notes,
+  });
+}
+
+class _ReviewedHistoryDialog extends StatefulWidget {
+  final String initialTitle;
+  final DateTime? birthDate;
+  final DateTime? initialDate;
+  final String initialNotes;
+
+  const _ReviewedHistoryDialog({
+    required this.initialTitle,
+    this.birthDate,
+    this.initialDate,
+    this.initialNotes = '',
+  });
+
+  @override
+  State<_ReviewedHistoryDialog> createState() =>
+      _ReviewedHistoryDialogState();
+}
+
+class _ReviewedHistoryDialogState extends State<_ReviewedHistoryDialog> {
+  final _key = GlobalKey<FormState>();
+  late final TextEditingController _title;
+  final _notes = TextEditingController();
+  DateTime? _eventDate;
+  bool _confirmed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _title = TextEditingController(text: widget.initialTitle);
+    _notes.text = widget.initialNotes;
+    _eventDate = widget.initialDate;
+  }
+
+  @override
+  void dispose() {
+    _title.dispose();
+    _notes.dispose();
+    super.dispose();
+  }
+
+  Future<void> _chooseDate() async {
+    final today = DateUtils.dateOnly(DateTime.now());
+    final earliest = widget.birthDate == null
+        ? DateTime(1900)
+        : DateUtils.dateOnly(widget.birthDate!);
+    if (earliest.isAfter(today)) return;
+    final chosen = await showDatePicker(
+      context: context,
+      initialDate: _eventDate ?? today,
+      firstDate: earliest,
+      lastDate: today,
+      helpText: 'ACTUAL REPORT / MEDICAL EVENT DATE',
+    );
+    if (chosen != null && mounted) setState(() => _eventDate = chosen);
+  }
+
+  void _submit() {
+    if (!_key.currentState!.validate()) return;
+    if (_eventDate == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Select the actual event date.')),
+      );
+      return;
+    }
+    if (!_confirmed) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Review and confirm the information.')),
+      );
+      return;
+    }
+    Navigator.of(context).pop(_ReviewedHistoryInput(
+      title: _title.text.trim(),
+      date: _eventDate!,
+      notes: _notes.text.trim(),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Review Medical History Entry'),
+      content: SizedBox(
+        width: 440,
+        child: SingleChildScrollView(
+          child: Form(
+            key: _key,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text('Check the original report carefully. '
+                    'This is a parent-reported entry, not a diagnosis.',
+                    style: TextStyle(fontSize: 12)),
+                const SizedBox(height: 14),
+                TextFormField(
+                  controller: _title,
+                  maxLength: 160,
+                  decoration: const InputDecoration(
+                    labelText: 'Event / report title *',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (text) => (text ?? '').trim().isEmpty
+                      ? 'Enter a title' : null,
+                ),
+                OutlinedButton.icon(
+                  onPressed: _chooseDate,
+                  icon: const Icon(Icons.calendar_today_outlined),
+                  label: Text(_eventDate == null
+                      ? 'Choose actual event date *'
+                      : _formatDate(_eventDate)),
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _notes,
+                  maxLength: 2000,
+                  maxLines: 4,
+                  decoration: const InputDecoration(
+                    labelText: 'Notes from reviewed report (optional)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                CheckboxListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _confirmed,
+                  title: const Text('I reviewed the source report and '
+                      'confirmed the entered details.'),
+                  onChanged: (value) =>
+                      setState(() => _confirmed = value ?? false),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel')),
+        FilledButton(onPressed: _submit,
+            child: const Text('Save Reviewed Entry')),
+      ],
     );
   }
 }
@@ -3268,3 +3949,4 @@ Widget _medicalPanel(
     ),
   );
 }
+

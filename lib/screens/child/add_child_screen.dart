@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -29,7 +28,7 @@ import '../auth/login_screen.dart';
 // - Guardian contact
 // - Up to five emergency contacts
 // - Doctor referral
-// - Edit/Delete API placeholders
+// - Backend-connected Edit/Delete actions (soft delete)
 //
 // ============================================================
 
@@ -251,10 +250,38 @@ class _ChildProfile {
 }
 
 // ============================================================
+// PHONE NORMALIZATION
+// Use +91 as the default when the user types 10 Indian digits.
+// Preserve valid international numbers already saved in v5.
+// ============================================================
+
+String _normalizeContactNumber(String value) {
+  final mobile = value.trim().replaceAll(' ', '');
+  return RegExp(r'^\d{10}$').hasMatch(mobile)
+      ? '+91$mobile'
+      : mobile;
+}
+
+bool _validContactNumber(String value) {
+  final normalized = _normalizeContactNumber(value);
+  return RegExp(r'^\+?[1-9][0-9]{7,14}$').hasMatch(normalized);
+}
+
+// ============================================================
 // EMERGENCY CONTACT MODEL
 // ============================================================
 
 class _EmergencyContactInput {
+  _EmergencyContactInput({
+    String name = '',
+    String mobileNumber = '',
+    String relationship = '',
+  }) {
+    nameController.text = name;
+    mobileController.text = mobileNumber;
+    relationshipController.text = relationship;
+  }
+
   final TextEditingController nameController =
   TextEditingController();
 
@@ -267,8 +294,7 @@ class _EmergencyContactInput {
   Map<String, dynamic> toJson() {
     return {
       'name': nameController.text.trim(),
-      'mobile_number':
-      '+91${mobileController.text.trim()}',
+      'mobile_number': _normalizeContactNumber(mobileController.text),
       'relationship':
       relationshipController.text.trim(),
     };
@@ -328,6 +354,9 @@ class _AddChildScreenState extends State<AddChildScreen> {
   final TextEditingController _guardianController =
   TextEditingController();
 
+  final TextEditingController _guardianNameController =
+  TextEditingController();
+
   final TextEditingController _referralController =
   TextEditingController();
 
@@ -363,6 +392,12 @@ class _AddChildScreenState extends State<AddChildScreen> {
   bool _submitted = false;
   bool _showDobError = false;
   bool _showForm = true;
+
+  // V5 profile edit uses PATCH with a complete edited form.
+  String? _editingChildId;
+  String? _accountGuardianName;
+  String? _accountGuardianMobile;
+  bool _loadingAccount = false;
 
   // ==========================================================
   // API BASE URL
@@ -467,6 +502,7 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
     _loadChildren();
     _loadParentProfiles();
+    _loadAccount();
   }
 
   // ==========================================================
@@ -477,6 +513,7 @@ class _AddChildScreenState extends State<AddChildScreen> {
   void dispose() {
     _nameController.dispose();
     _guardianController.dispose();
+    _guardianNameController.dispose();
     _referralController.dispose();
 
     for (final contact in _contacts) {
@@ -538,6 +575,17 @@ class _AddChildScreenState extends State<AddChildScreen> {
           .timeout(
         const Duration(seconds: 30),
       );
+    } else if (method == 'PATCH') {
+      response = await _httpClient.patch(
+        uri,
+        headers: headers,
+        body: jsonEncode(body ?? {}),
+      ).timeout(const Duration(seconds: 30));
+    } else if (method == 'DELETE') {
+      response = await _httpClient.delete(
+        uri,
+        headers: headers,
+      ).timeout(const Duration(seconds: 30));
     } else {
       throw const AddChildApiException(
         statusCode: 0,
@@ -592,8 +640,17 @@ class _AddChildScreenState extends State<AddChildScreen> {
       }
 
       if (response.statusCode == 401) {
-        message =
-        'Your session has expired. Please log in again.';
+        message = 'Your session has expired. Please log in again.';
+      } else if (response.statusCode == 403) {
+        message = 'You cannot modify this child profile.';
+      } else if (response.statusCode == 404) {
+        message = 'Child profile not found. Refresh your list.';
+      } else if (response.statusCode == 422 &&
+          errorData is Map && errorData['fields'] is List) {
+        final fields = errorData['fields'] as List;
+        if (fields.isNotEmpty) {
+          message = 'Please review the entered information: $message';
+        }
       }
 
       throw AddChildApiException(
@@ -648,6 +705,42 @@ class _AddChildScreenState extends State<AddChildScreen> {
           duration: const Duration(seconds: 4),
         ),
       );
+  }
+
+  // ==========================================================
+  // LOAD ACCOUNT DEFAULTS - GET /api/v1/patients/me
+  // Backend uses these when guardian fields are omitted.
+  // ==========================================================
+
+  Future<void> _loadAccount() async {
+    if (_loadingAccount) return;
+    setState(() => _loadingAccount = true);
+
+    try {
+      final data = await _apiRequest('GET', '/api/v1/patients/me');
+      final rawUser = data['user'];
+      if (rawUser is! Map || !mounted) return;
+
+      final name = (rawUser['full_name'] ?? '').toString().trim();
+      final mobile = (rawUser['phone_number'] ?? '').toString().trim();
+
+      setState(() {
+        _accountGuardianName = name;
+        _accountGuardianMobile = mobile;
+        if (_editingChildId == null) {
+          if (_guardianNameController.text.trim().isEmpty) {
+            _guardianNameController.text = name;
+          }
+          if (_guardianController.text.trim().isEmpty) {
+            _guardianController.text = mobile;
+          }
+        }
+      });
+    } catch (_) {
+      // Optional UI defaults; the server still defaults to account details.
+    } finally {
+      if (mounted) setState(() => _loadingAccount = false);
+    }
   }
 
   // ==========================================================
@@ -855,20 +948,12 @@ class _AddChildScreenState extends State<AddChildScreen> {
     return null;
   }
 
-  String? _validateMobile(
-      String? value, {
-        bool isRequired = false,
-      }) {
+  String? _validateMobile(String? value, {bool isRequired = false}) {
     final mobile = (value ?? '').trim();
-
-    if (mobile.isEmpty && !isRequired) {
-      return null;
+    if (mobile.isEmpty && !isRequired) return null;
+    if (!_validContactNumber(mobile)) {
+      return 'Enter 10 Indian digits or a valid +countrycode number';
     }
-
-    if (!RegExp(r'^\d{10}$').hasMatch(mobile)) {
-      return 'Enter a valid 10-digit mobile number';
-    }
-
     return null;
   }
 
@@ -962,7 +1047,8 @@ class _AddChildScreenState extends State<AddChildScreen> {
     List<_EmergencyContactInput>.from(_contacts);
 
     _nameController.clear();
-    _guardianController.clear();
+    _guardianController.text = _accountGuardianMobile ?? '';
+    _guardianNameController.text = _accountGuardianName ?? '';
     _referralController.clear();
 
     setState(() {
@@ -973,6 +1059,7 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
       _submitted = false;
       _showDobError = false;
+      _editingChildId = null;
 
       _contacts.clear();
     });
@@ -997,178 +1084,252 @@ class _AddChildScreenState extends State<AddChildScreen> {
       _showDobError = _dateOfBirth == null;
     });
 
-    final valid =
-        _formKey.currentState?.validate() ?? false;
-
+    final valid = _formKey.currentState?.validate() ?? false;
     if (!valid || _dateOfBirth == null) {
-      _showMessage(
-        'Please complete the required details.',
-        error: true,
-      );
+      _showMessage('Please complete the required details.', error: true);
       return;
     }
 
     final dob = _dateOfBirth!;
-
-    if (dob.isAfter(_today) ||
-        dob.isBefore(_earliestBirthDate)) {
-      _showMessage(
-        'Child age must be between 0 and 12 years.',
-        error: true,
-      );
+    if (dob.isAfter(_today) || dob.isBefore(_earliestBirthDate)) {
+      _showMessage('Child age must be between 0 and 12 years.', error: true);
       return;
     }
 
-    FocusScope.of(context).unfocus();
+    final editingId = _editingChildId;
+    final guardianName = _guardianNameController.text.trim();
+    final guardianMobile = _guardianController.text.trim();
+    final referralId = _referralController.text.trim();
 
-    setState(() {
-      _isSaving = true;
-    });
+    final payload = <String, dynamic>{
+      'full_name': _nameController.text.trim(),
+      'date_of_birth': _apiDate(dob),
+      'guardian_name': guardianName,
+      'guardian_contact': guardianMobile.isEmpty
+          ? ''
+          : _normalizeContactNumber(guardianMobile),
+      'emergency_contacts': _contacts.map((c) => c.toJson()).toList(),
+    };
 
-    try {
-      final guardianMobile =
-      _guardianController.text.trim();
-
-      final referralId =
-      _referralController.text.trim();
-
-      // Backend-compatible payload.
-
-      final payload = <String, dynamic>{
+    if (editingId == null) {
+      payload.addAll({
         'profile_type': 'member',
         'module': 'child',
-        'full_name': _nameController.text.trim(),
-        'date_of_birth': _apiDate(dob),
         'parent_profile_id': _selectedParentId,
-        'guardian_contact': guardianMobile.isEmpty
-            ? ''
-            : '+91$guardianMobile',
-        'emergency_contacts': _contacts
-            .map(
-              (contact) => contact.toJson(),
-        )
-            .toList(),
-        'referral_id': referralId.isEmpty
-            ? null
-            : referralId,
-      };
+        'referral_id': referralId.isEmpty ? null : referralId,
+      });
+      // If /me was unavailable, let backend default guardian fields.
+      if (guardianName.isEmpty) payload.remove('guardian_name');
+      if (guardianMobile.isEmpty) payload.remove('guardian_contact');
+    }
 
+    FocusScope.of(context).unfocus();
+    setState(() => _isSaving = true);
+
+    bool savedOnServer = false;
+    try {
       final response = await _apiRequest(
-        'POST',
-        '/api/v1/patients/profiles',
+        editingId == null ? 'POST' : 'PATCH',
+        editingId == null
+            ? '/api/v1/patients/profiles'
+            : '/api/v1/patients/profiles/${Uri.encodeComponent(editingId)}',
         body: payload,
       );
+      savedOnServer = true;
 
       final rawProfile = response['profile'];
-
       if (rawProfile is! Map) {
         throw const AddChildApiException(
           statusCode: 0,
           code: 'invalid_profile',
-          message:
-          'The server did not return a valid profile. '
-              'Refresh the child list before retrying.',
+          message: 'Saved, but the server did not return a profile. Refresh to verify.',
         );
       }
-
-      final createdProfile =
-      Map<String, dynamic>.from(rawProfile);
+      final updatedProfile = Map<String, dynamic>.from(rawProfile);
 
       if (!mounted) return;
-
-      // Reset after successful creation.
       _clearFormValues();
-
-      // Reload cards from Flask.
       final refreshed = await _loadChildren();
-
       if (!mounted) return;
 
-      _showMessage(
-        refreshed
-            ? 'Child profile created successfully!'
-            : 'Child saved. Refresh the list to see it.',
-      );
+      _showMessage(refreshed
+          ? editingId == null
+          ? 'Child profile created successfully!'
+          : 'Child profile updated successfully!'
+          : 'Profile saved. Refresh the list to view the latest data.');
 
-      // Preserve the existing dashboard callback.
-      try {
-        widget.onChildCreated?.call(createdProfile);
-      } catch (_) {
-        // The server-side save has already succeeded.
+      if (editingId == null) {
+        widget.onChildCreated?.call(updatedProfile);
       }
 
       if (!mounted) return;
-
       if (_scrollController.hasClients) {
         await _scrollController.animateTo(
           0,
-          duration: const Duration(
-            milliseconds: 350,
-          ),
+          duration: const Duration(milliseconds: 350),
           curve: Curves.easeOut,
         );
       }
     } catch (error) {
+      if (!mounted) return;
       _showMessage(
-        _errorText(error),
+        savedOnServer
+            ? 'Changes were saved, but the screen could not refresh. Check the list before retrying.'
+            : _errorText(error),
         error: true,
       );
     } finally {
-      if (mounted) {
-        setState(() {
-          _isSaving = false;
-        });
-      }
+      if (mounted) setState(() => _isSaving = false);
     }
   }
 
   // ==========================================================
-  // EDIT / DELETE API PLACEHOLDERS
+  // EDIT / DELETE (REAL BACKEND V5 APIs)
   // ==========================================================
 
-  void _editChild(_ChildProfile child) {
-    _showPendingAction(
-      child: child,
-      isDelete: false,
-    );
-  }
-
-  void _deleteChild(_ChildProfile child) {
-    _showPendingAction(
-      child: child,
-      isDelete: true,
-    );
-  }
-
-  void _showPendingAction({
-    required _ChildProfile child,
-    required bool isDelete,
-  }) {
-    showDialog<void>(
-      context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          title: Text(
-            isDelete ? 'Delete Child' : 'Edit Child',
-          ),
-          content: Text(
-            '${child.fullName}\n\n'
-                '${isDelete ? 'Deletion' : 'Editing'} '
-                'will be available when the corresponding '
-                'backend API is added.\n\n'
-                'No child information has been changed.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(dialogContext).pop();
-              },
-              child: const Text('OK'),
-            ),
-          ],
+  Future<void> _editChild(_ChildProfile child) async {
+    if (_isSaving) return;
+    setState(() => _isSaving = true);
+    try {
+      // Fetch fresh values so editing cannot silently wipe stored contacts.
+      final response = await _apiRequest(
+        'GET',
+        '/api/v1/children/${Uri.encodeComponent(child.id)}',
+      );
+      final raw = response['child'];
+      if (raw is! Map) {
+        throw const AddChildApiException(
+          statusCode: 0,
+          code: 'invalid_child',
+          message: 'Could not load latest profile for editing.',
         );
-      },
+      }
+      final data = Map<String, dynamic>.from(raw);
+      if (data['id'] != child.id || data['module'] != 'child') {
+        throw const AddChildApiException(
+          statusCode: 0,
+          code: 'profile_mismatch',
+          message: 'Unexpected profile returned. Please refresh.',
+        );
+      }
+      final dob = DateTime.tryParse('${data['date_of_birth'] ?? ''}');
+      if (dob == null) {
+        throw const AddChildApiException(
+          statusCode: 0,
+          code: 'invalid_dob',
+          message: 'Cannot edit a child without a valid date of birth.',
+        );
+      }
+
+      final old = List<_EmergencyContactInput>.from(_contacts);
+      final incoming = <_EmergencyContactInput>[];
+      final rawContacts = data['emergency_contacts'];
+      if (rawContacts is List) {
+        for (final entry in rawContacts) {
+          if (entry is! Map) continue;
+          incoming.add(_EmergencyContactInput(
+            name: '${entry['name'] ?? ''}',
+            mobileNumber: '${entry['mobile_number'] ?? ''}',
+            relationship: '${entry['relationship'] ?? ''}',
+          ));
+        }
+      }
+      if (!mounted) {
+        for (final item in incoming) { item.dispose(); }
+        return;
+      }
+      _nameController.text = '${data['full_name'] ?? ''}';
+      _guardianNameController.text = '${data['guardian_name'] ?? ''}';
+      _guardianController.text = '${data['guardian_contact'] ?? ''}';
+      _referralController.clear();
+      setState(() {
+        _editingChildId = child.id;
+        _dateOfBirth = dob;
+        _selectedParentId = data['parent_profile_id']?.toString();
+        _submitted = false;
+        _showDobError = false;
+        _showForm = true;
+        _formKey = GlobalKey<FormState>();
+        _contacts
+          ..clear()
+          ..addAll(incoming);
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        for (final item in old) { item.dispose(); }
+      });
+      _showMessage('Editing ${child.fullName}. Save Changes to update the database.');
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _scrollController.hasClients) {
+          _scrollController.animateTo(
+            _scrollController.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 350),
+            curve: Curves.easeOut,
+          );
+        }
+      });
+    } catch (error) {
+      _showMessage(_errorText(error), error: true);
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
+  }
+
+  Future<void> _deleteChild(_ChildProfile child) async {
+    if (_isSaving) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete child profile?'),
+        content: Text(
+          'Remove ${child.fullName} from your FamilyCare+ workspace? '
+              'Their health records will become inaccessible in the app, '
+              'and reminders will stop. Private records are retained '
+              'by the backend for audit/retention. This cannot be undone here.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: AddChildColors.error,
+            ),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Delete Child'),
+          ),
+        ],
+      ),
     );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _isSaving = true);
+    bool deletedOnServer = false;
+    try {
+      await _apiRequest(
+        'DELETE',
+        '/api/v1/patients/profiles/${Uri.encodeComponent(child.id)}',
+      );
+      deletedOnServer = true;
+      if (!mounted) return;
+      if (_editingChildId == child.id) _clearFormValues();
+      final refreshed = await _loadChildren();
+      if (!mounted) return;
+      _showMessage(refreshed
+          ? '${child.fullName} was removed from your child profiles.'
+          : 'Child was removed. Refresh the list to update the cards.');
+    } catch (error) {
+      if (!mounted) return;
+      _showMessage(
+        deletedOnServer
+            ? 'Child was removed, but the list could not refresh.'
+            : _errorText(error),
+        error: true,
+      );
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
   }
 
   // ==========================================================
@@ -1310,6 +1471,13 @@ class _AddChildScreenState extends State<AddChildScreen> {
                   _detailRow(
                     'Parent Profile',
                     parentText,
+                  ),
+
+                  _detailRow(
+                    'Guardian Name',
+                    (data['guardian_name'] ?? '').toString().trim().isEmpty
+                        ? 'Not provided'
+                        : '${data['guardian_name']}',
                   ),
 
                   _detailRow(
@@ -2091,9 +2259,7 @@ class _AddChildScreenState extends State<AddChildScreen> {
               // Edit placeholder.
               IconButton(
                 tooltip: 'Edit Child',
-                onPressed: () {
-                  _editChild(child);
-                },
+                onPressed: _isSaving ? null : () => _editChild(child),
                 icon: const Icon(
                   Icons.edit_outlined,
                   color: AddChildColors.blue,
@@ -2103,9 +2269,7 @@ class _AddChildScreenState extends State<AddChildScreen> {
               // Delete placeholder.
               IconButton(
                 tooltip: 'Delete Child',
-                onPressed: () {
-                  _deleteChild(child);
-                },
+                onPressed: _isSaving ? null : () => _deleteChild(child),
                 icon: const Icon(
                   Icons.delete_outline_rounded,
                   color: AddChildColors.error,
@@ -2191,9 +2355,11 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
               const SizedBox(width: 12),
 
-              const Expanded(
+              Expanded(
                 child: Text(
-                  'Add New Child',
+                  _editingChildId == null
+                      ? 'Add New Child'
+                      : 'Edit Child Profile',
                   style: TextStyle(
                     fontSize: 17,
                     fontWeight: FontWeight.w800,
@@ -2232,6 +2398,15 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
             child: Column(
               children: [
+                if (_editingChildId != null) ...[
+                  _buildInfoBox(
+                    'Editing an existing child profile. Name, birth date, '
+                        'guardian details and emergency contacts will be '
+                        'updated on the server. The linked parent and doctor '
+                        'cannot be changed from this form.',
+                  ),
+                  const SizedBox(height: 15),
+                ],
                 _buildBasicDetailsCard(),
 
                 const SizedBox(height: 17),
@@ -2244,7 +2419,8 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
                 const SizedBox(height: 17),
 
-                _buildDoctorConnectionCard(),
+                if (_editingChildId == null)
+                  _buildDoctorConnectionCard(),
 
                 const SizedBox(height: 23),
 
@@ -2311,7 +2487,8 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
           const SizedBox(height: 18),
 
-          _buildParentSelector(),
+          if (_editingChildId == null)
+            _buildParentSelector(),
         ],
       ),
     );
@@ -2582,28 +2759,44 @@ class _AddChildScreenState extends State<AddChildScreen> {
       child: Column(
         children: [
           _textField(
+            label: 'Guardian Name',
+            optional: true,
+            hint: 'Name of parent or guardian',
+            controller: _guardianNameController,
+            icon: Icons.person_outline_rounded,
+            inputFormatters: [LengthLimitingTextInputFormatter(120)],
+            validator: (value) => (value ?? '').trim().length > 120
+                ? 'Maximum 120 characters allowed'
+                : null,
+          ),
+
+          const SizedBox(height: 16),
+
+          _textField(
             label: 'Guardian Mobile Number',
             optional: true,
-            hint: 'Enter 10-digit mobile number',
+            hint: '+919876543210 or 10-digit mobile',
             controller: _guardianController,
             icon: Icons.phone_android_outlined,
-            prefix: '+91  ',
+            prefix: null,
             keyboardType: TextInputType.phone,
             validator: (value) {
               return _validateMobile(value);
             },
             inputFormatters: [
-              FilteringTextInputFormatter.digitsOnly,
-              LengthLimitingTextInputFormatter(10),
+              FilteringTextInputFormatter.allow(RegExp(r'[+0-9]')),
+              LengthLimitingTextInputFormatter(16),
             ],
           ),
 
           const SizedBox(height: 12),
 
           _buildInfoBox(
-            'The mobile number is used as a contact '
-                'detail. No mobile OTP verification is '
-                'required for this child profile.',
+            _loadingAccount
+                ? 'Loading account contact defaults...'
+                : 'Guardian name and mobile default to the account details. '
+                'You can override them. These are contact details, '
+                'not mobile OTP verification.',
           ),
         ],
       ),
@@ -2788,10 +2981,10 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
           _textField(
             label: 'Mobile Number',
-            hint: 'Enter 10-digit number',
+            hint: '+919876543210 or 10-digit mobile',
             controller: contact.mobileController,
             icon: Icons.phone_outlined,
-            prefix: '+91  ',
+            prefix: null,
             keyboardType: TextInputType.phone,
             validator: (value) {
               return _validateMobile(
@@ -2800,8 +2993,8 @@ class _AddChildScreenState extends State<AddChildScreen> {
               );
             },
             inputFormatters: [
-              FilteringTextInputFormatter.digitsOnly,
-              LengthLimitingTextInputFormatter(10),
+              FilteringTextInputFormatter.allow(RegExp(r'[+0-9]')),
+              LengthLimitingTextInputFormatter(16),
             ],
           ),
         ],
@@ -2912,7 +3105,7 @@ class _AddChildScreenState extends State<AddChildScreen> {
             ),
           ),
 
-          child: const Text('Clear Form'),
+          child: Text(_editingChildId == null ? 'Clear Form' : 'Cancel Edit'),
         );
 
         final saveButton = FilledButton.icon(
@@ -2935,8 +3128,10 @@ class _AddChildScreenState extends State<AddChildScreen> {
 
           label: Text(
             _isSaving
-                ? 'Saving Child...'
-                : 'Save Child Profile',
+                ? 'Saving...'
+                : _editingChildId == null
+                ? 'Save Child Profile'
+                : 'Save Changes',
           ),
 
           style: FilledButton.styleFrom(

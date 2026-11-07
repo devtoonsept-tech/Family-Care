@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -8,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
 import '../auth/login_screen.dart';
+import 'add_child_screen.dart';
 
 // ============================================================
 // FAMILYCARE+ - CHILD PROFILE SCREEN
@@ -30,7 +30,9 @@ import '../auth/login_screen.dart';
 // - Healthcare service navigation
 // - Medical report summary
 // - Loading and refresh
-// - Edit/Delete placeholders
+// - Account owner name from signed-in signup account
+// - All children + Add Child action
+// - Backend Edit/Delete, doctor disconnect and activity overview
 //
 // ============================================================
 
@@ -131,6 +133,22 @@ class _ChildProfileScreenState
   // ----------------------------------------------------------
 
   Map<String, dynamic>? _profile;
+  Map<String, dynamic>? _account;
+  List<Map<String, dynamic>> _children = [];
+  List<Map<String, dynamic>> _doctorEntries = [];
+  int _doctorEntryTotal = 0;
+  String? _accountError;
+  String? _childrenError;
+  String? _doctorOverviewError;
+  bool _loadingAccount = true;
+  bool _loadingChildren = true;
+  bool _loadingDoctorOverview = false;
+  bool _isUpdating = false;
+  bool _isDeleting = false;
+  bool _isDisconnectingDoctor = false;
+  int _accountRequest = 0;
+  int _childrenRequest = 0;
+  int _doctorOverviewRequest = 0;
 
   List<Map<String, dynamic>> _recentReports = [];
 
@@ -189,6 +207,8 @@ class _ChildProfileScreenState
     super.initState();
 
     _loadChildProfile();
+    _loadAccount();
+    _loadChildren();
   }
 
   @override
@@ -212,12 +232,21 @@ class _ChildProfileScreenState
       _isConnectingDoctor = false;
 
       _loadChildProfile();
+      _doctorEntries = [];
+      _doctorEntryTotal = 0;
+      if (oldWidget.apiBaseUrl != widget.apiBaseUrl) {
+        _loadAccount();
+        _loadChildren();
+      }
     }
   }
 
   @override
   void dispose() {
     _requestVersion++;
+    _accountRequest++;
+    _childrenRequest++;
+    _doctorOverviewRequest++;
     _httpClient.close();
 
     super.dispose();
@@ -419,12 +448,27 @@ class _ChildProfileScreenState
           .timeout(
         const Duration(seconds: 30),
       );
+    } else if (method == 'PATCH') {
+      response = await _httpClient.patch(
+        uri,
+        headers: headers,
+        body: jsonEncode(body ?? {}),
+      ).timeout(const Duration(seconds: 30));
+    } else if (method == 'DELETE') {
+      response = await _httpClient.delete(
+        uri,
+        headers: headers,
+      ).timeout(const Duration(seconds: 30));
     } else {
       throw const ChildProfileApiException(
         statusCode: 0,
         code: 'unsupported_method',
         message: 'Unsupported API request method.',
       );
+    }
+
+    if (response.statusCode == 204 && response.bodyBytes.isEmpty) {
+      return <String, dynamic>{};
     }
 
     Map<String, dynamic> result;
@@ -547,6 +591,113 @@ class _ChildProfileScreenState
           duration: const Duration(seconds: 4),
         ),
       );
+  }
+
+  // ==========================================================
+  // SIGNED-IN ACCOUNT IDENTITY - GET /api/v1/patients/me
+  // This is the registration name, not a child/guardian guess.
+  // ==========================================================
+
+  Future<void> _loadAccount() async {
+    final requestId = ++_accountRequest;
+    if (!mounted) return;
+    setState(() {
+      _loadingAccount = true;
+      _accountError = null;
+    });
+    try {
+      final data = await _apiRequest('GET', '/api/v1/patients/me');
+      if (data['user'] is! Map) {
+        throw const ChildProfileApiException(
+          statusCode: 0,
+          code: 'invalid_account',
+          message: 'Account details were not returned.',
+        );
+      }
+      if (!mounted || requestId != _accountRequest) return;
+      setState(() {
+        _account = Map<String, dynamic>.from(data['user'] as Map);
+      });
+    } catch (error) {
+      if (!mounted || requestId != _accountRequest) return;
+      setState(() => _accountError = _errorText(error));
+    } finally {
+      if (mounted && requestId == _accountRequest) {
+        setState(() => _loadingAccount = false);
+      }
+    }
+  }
+
+  // ==========================================================
+  // ALL CHILD PROFILES FOR SAME ACCOUNT
+  // ==========================================================
+
+  Future<void> _loadChildren() async {
+    final requestId = ++_childrenRequest;
+    if (!mounted) return;
+    setState(() {
+      _loadingChildren = true;
+      _childrenError = null;
+    });
+    try {
+      final children = <Map<String, dynamic>>[];
+      for (int page = 1; page <= 100; page++) {
+        final data = await _apiRequest(
+          'GET', '/api/v1/children?page=$page&per_page=100',
+        );
+        if (data['items'] is! List) {
+          throw const ChildProfileApiException(
+            statusCode: 0,
+            code: 'invalid_children',
+            message: 'Invalid children list received.',
+          );
+        }
+        final batch = (data['items'] as List)
+            .whereType<Map>()
+            .map((item) => Map<String, dynamic>.from(item))
+            .toList();
+        children.addAll(batch);
+        if (!mounted || requestId != _childrenRequest) return;
+        final total = data['total'];
+        if (batch.length < 100 ||
+            (total is num && children.length >= total)) break;
+      }
+      if (!mounted || requestId != _childrenRequest) return;
+      setState(() => _children = children);
+    } catch (error) {
+      if (!mounted || requestId != _childrenRequest) return;
+      setState(() => _childrenError = _errorText(error));
+    } finally {
+      if (mounted && requestId == _childrenRequest) {
+        setState(() => _loadingChildren = false);
+      }
+    }
+  }
+
+  Future<void> _addChild() async {
+    if (_isUpdating || _isDeleting) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => AddChildScreen(apiBaseUrl: _baseUrl),
+      ),
+    );
+    if (!mounted) return;
+    await _loadChildren();
+  }
+
+  Future<void> _openAnotherChild(String profileId) async {
+    if (profileId == widget.profileId) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (_) => ChildProfileScreen(
+          profileId: profileId,
+          apiBaseUrl: _baseUrl,
+          onOpenSection: widget.onOpenSection,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    await _loadChildren();
   }
 
   // ==========================================================
@@ -845,34 +996,210 @@ class _ChildProfileScreenState
   }
 
   // ==========================================================
-  // EDIT / DELETE PLACEHOLDERS
+  // EDIT PROFILE - V5 REQUIRES FULL REPLACEMENT FIELDS
   // ==========================================================
 
-  void _showPendingAction(String action) {
-    showDialog<void>(
+  Future<void> _editChildProfile() async {
+    if (_profile == null || _isUpdating || _isDeleting) return;
+    final profileId = widget.profileId;
+    final payload = await showDialog<Map<String, dynamic>>(
       context: context,
-      builder: (dialogContext) {
-        return AlertDialog(
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(18),
-          ),
-          title: Text('$action Child Profile'),
-          content: Text(
-            '$action is not available yet because '
-                'the corresponding profile API is pending.\n\n'
-                'No child information has been changed.',
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(dialogContext).pop();
-              },
-              child: const Text('OK'),
-            ),
-          ],
-        );
-      },
+      barrierDismissible: false,
+      builder: (_) => _ChildProfileEditDialog(profile: _profile!),
     );
+    if (!mounted || payload == null || widget.profileId != profileId) return;
+    setState(() => _isUpdating = true);
+    try {
+      final result = await _apiRequest(
+        'PATCH', _profileEndpoint, body: payload,
+      );
+      if (!mounted || widget.profileId != profileId) return;
+      if (result['profile'] is Map) {
+        setState(() {
+          _profile = Map<String, dynamic>.from(result['profile'] as Map);
+        });
+      }
+      _showMessage('Child profile updated successfully.');
+      await Future.wait<void>([_loadChildProfile(), _loadChildren()]);
+    } catch (error) {
+      if (mounted && widget.profileId == profileId) {
+        _showMessage(_errorText(error), error: true);
+      }
+    } finally {
+      if (mounted && widget.profileId == profileId) {
+        setState(() => _isUpdating = false);
+      }
+    }
+  }
+
+  // ==========================================================
+  // DELETE PROFILE - SOFT DELETE WITH CONFIRMATION
+  // ==========================================================
+
+  Future<void> _deleteChildProfile() async {
+    if (_profile == null || _isUpdating || _isDeleting) return;
+    final profileId = widget.profileId;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Remove child profile?'),
+        content: Text(
+          'Remove $_childName from your care workspace? '
+              'The backend retains private records for audit/retention, '
+              'but they will no longer be accessible through this workspace. '
+              'This action cannot be undone in the app.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+              backgroundColor: ChildProfileColors.error,
+            ),
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Remove child'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || confirmed != true || widget.profileId != profileId) return;
+    setState(() => _isDeleting = true);
+    try {
+      await _apiRequest('DELETE', _profileEndpoint);
+      if (!mounted || widget.profileId != profileId) return;
+      _showMessage('Child profile removed from your workspace.');
+      Navigator.of(context).pop();
+    } catch (error) {
+      if (mounted && widget.profileId == profileId) {
+        _showMessage(_errorText(error), error: true);
+      }
+    } finally {
+      if (mounted && widget.profileId == profileId) {
+        setState(() => _isDeleting = false);
+      }
+    }
+  }
+
+  // ==========================================================
+  // DISCONNECT DOCTOR
+  // ==========================================================
+
+  Future<void> _disconnectDoctor() async {
+    if (_connectedDoctor == null || _isDisconnectingDoctor) return;
+    final id = widget.profileId;
+    final approved = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Disconnect doctor?'),
+        content: const Text(
+          'This will remove the doctor connection for this child. '
+              'Doctor access will be recalculated by the backend.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Disconnect'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || approved != true || widget.profileId != id) return;
+    setState(() => _isDisconnectingDoctor = true);
+    try {
+      final result = await _apiRequest('DELETE', '$_profileEndpoint/doctor');
+      if (!mounted || widget.profileId != id) return;
+      if (result['profile'] is Map) {
+        setState(() => _profile = Map<String, dynamic>.from(result['profile'] as Map));
+      }
+      _doctorEntries = [];
+      _doctorEntryTotal = 0;
+      _showMessage('Doctor disconnected successfully.');
+      await _loadChildProfile();
+    } catch (error) {
+      if (mounted && widget.profileId == id) {
+        _showMessage(_errorText(error), error: true);
+      }
+    } finally {
+      if (mounted && widget.profileId == id) {
+        setState(() => _isDisconnectingDoctor = false);
+      }
+    }
+  }
+
+  // ==========================================================
+  // DOCTOR-GENERATED HEALTH RECORD OVERVIEW
+  // ==========================================================
+
+  Future<void> _showDoctorOverview() async {
+    if (_connectedDoctor == null || _loadingDoctorOverview) return;
+    final id = widget.profileId;
+    final version = ++_doctorOverviewRequest;
+    setState(() {
+      _loadingDoctorOverview = true;
+      _doctorOverviewError = null;
+    });
+    try {
+      final result = await _apiRequest(
+        'GET', '$_profileEndpoint/doctor-overview?page=1&per_page=20',
+      );
+      if (!mounted || version != _doctorOverviewRequest || id != widget.profileId) return;
+      _doctorEntries = result['items'] is List
+          ? (result['items'] as List).whereType<Map>()
+          .map((entry) => Map<String, dynamic>.from(entry)).toList()
+          : [];
+      _doctorEntryTotal = result['total'] is num
+          ? (result['total'] as num).toInt() : _doctorEntries.length;
+      await showModalBottomSheet<void>(
+        context: context,
+        isScrollControlled: true,
+        useSafeArea: true,
+        builder: (sheetContext) => FractionallySizedBox(
+          heightFactor: .75,
+          child: ListView(
+            padding: const EdgeInsets.all(20),
+            children: [
+              const Text('Doctor Care Overview',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 7),
+              Text('$_doctorEntryTotal doctor-created records',
+                  style: const TextStyle(color: ChildProfileColors.muted)),
+              const SizedBox(height: 10),
+              if (_doctorEntries.isEmpty)
+                const ListTile(title: Text('No doctor-created records yet.')),
+              for (final entry in _doctorEntries)
+                ListTile(
+                  leading: const Icon(Icons.medical_information_outlined,
+                      color: ChildProfileColors.green),
+                  title: Text(_stringValue(entry['title'], fallback: 'Care record')),
+                  subtitle: Text(
+                    '${_stringValue(entry['kind'], fallback: 'Record')}  •  '
+                        '${_stringValue(entry['date'], fallback: 'Date not recorded')}'
+                    'Doctor-reported • Read-only',
+                  ),
+                ),
+              const SizedBox(height: 12),
+              const Text('Doctor records shown here are read-only for parents.',
+                  style: TextStyle(fontSize: 11, color: ChildProfileColors.muted)),
+            ],
+          ),
+        ),
+      );
+    } catch (error) {
+      if (mounted && version == _doctorOverviewRequest && id == widget.profileId) {
+        setState(() => _doctorOverviewError = _errorText(error));
+        _showMessage(_doctorOverviewError!, error: true);
+      }
+    } finally {
+      if (mounted && version == _doctorOverviewRequest && id == widget.profileId) {
+        setState(() => _loadingDoctorOverview = false);
+      }
+    }
   }
 
   // ==========================================================
@@ -923,23 +1250,17 @@ class _ChildProfileScreenState
         ),
 
         actions: [
-          // Future profile editing/deletion.
           PopupMenuButton<String>(
             tooltip: 'Profile actions',
-            enabled: _profile != null,
-            onSelected: _showPendingAction,
-            itemBuilder: (context) {
-              return const [
-                PopupMenuItem<String>(
-                  value: 'Edit',
-                  child: Text('Edit Profile (Soon)'),
-                ),
-                PopupMenuItem<String>(
-                  value: 'Delete',
-                  child: Text('Delete Profile (Soon)'),
-                ),
-              ];
+            enabled: _profile != null && !_isUpdating && !_isDeleting,
+            onSelected: (action) {
+              if (action == 'Edit') _editChildProfile();
+              if (action == 'Delete') _deleteChildProfile();
             },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'Edit', child: Text('Edit Child Profile')),
+              PopupMenuItem(value: 'Delete', child: Text('Remove Child Profile')),
+            ],
           ),
 
           IconButton(
@@ -1005,6 +1326,14 @@ class _ChildProfileScreenState
                 _buildBreadcrumb(),
 
                 const SizedBox(height: 15),
+
+                _buildAccountIdentity(),
+
+                const SizedBox(height: 16),
+
+                _buildChildrenOverview(),
+
+                const SizedBox(height: 16),
 
                 _buildProfileHero(),
 
@@ -1176,6 +1505,125 @@ class _ChildProfileScreenState
           ),
         ),
       ],
+    );
+  }
+
+  // ==========================================================
+  // ACCOUNT OWNER - NAME FROM SIGNUP /patients/me
+  // ==========================================================
+
+  Widget _buildAccountIdentity() {
+    return _sectionCard(
+      title: 'Account Holder',
+      subtitle: 'Registered FamilyCare+ account',
+      icon: Icons.account_circle_outlined,
+      content: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (_loadingAccount)
+            const LinearProgressIndicator(color: ChildProfileColors.green)
+          else if (_accountError != null)
+            Row(children: [
+              const Icon(Icons.error_outline, color: ChildProfileColors.error),
+              const SizedBox(width: 8),
+              Expanded(child: Text('Account details unavailable: $_accountError')),
+              TextButton(onPressed: _loadAccount, child: const Text('Retry')),
+            ])
+          else ...[
+              _detailRow(
+                label: 'Full Name',
+                value: _stringValue(_account?['full_name']),
+                icon: Icons.person_outline_rounded,
+              ),
+              const Divider(color: ChildProfileColors.border),
+              _detailRow(
+                label: 'Email',
+                value: _stringValue(_account?['email']),
+                icon: Icons.email_outlined,
+              ),
+              const Divider(color: ChildProfileColors.border),
+              _detailRow(
+                label: 'Mobile',
+                value: _stringValue(_account?['phone_number']),
+                icon: Icons.phone_outlined,
+              ),
+            ],
+          const SizedBox(height: 7),
+          _infoBox('This is your signed-in account identity. Child profiles '
+              'are linked to the account automatically; adding a child does '
+              'not change your signup name.'),
+        ],
+      ),
+    );
+  }
+
+  // ==========================================================
+  // CHILD LIST + ADD CHILD BELOW ACCOUNT IDENTITY
+  // ==========================================================
+
+  Widget _buildChildrenOverview() {
+    return _sectionCard(
+      title: 'Your Children',
+      subtitle: 'Profiles belonging to this account',
+      icon: Icons.family_restroom_rounded,
+      trailing: IconButton(
+        tooltip: 'Refresh children',
+        onPressed: _loadingChildren ? null : _loadChildren,
+        icon: const Icon(Icons.refresh_rounded,
+            color: ChildProfileColors.green),
+      ),
+      content: Column(
+        children: [
+          if (_loadingChildren)
+            const LinearProgressIndicator(color: ChildProfileColors.green)
+          else if (_childrenError != null)
+            _infoBox('Could not load children: $_childrenError')
+          else if (_children.isEmpty)
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 12),
+                child: Text('No child profiles found.',
+                    style: TextStyle(color: ChildProfileColors.muted)),
+              )
+            else ...[
+                for (final child in _children) ...[
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const CircleAvatar(
+                      backgroundColor: ChildProfileColors.lightGreen,
+                      child: Icon(Icons.child_care, color: ChildProfileColors.green),
+                    ),
+                    title: Text(_stringValue(child['full_name'], fallback: 'Child'),
+                        style: const TextStyle(fontWeight: FontWeight.w700,
+                            color: ChildProfileColors.navy)),
+                    subtitle: Text('DOB: ${_stringValue(child['date_of_birth'], fallback: 'Not recorded')}'),
+                    trailing: child['id'] == widget.profileId
+                        ? const Text('Current', style: TextStyle(
+                        color: ChildProfileColors.green, fontWeight: FontWeight.w700))
+                        : const Icon(Icons.chevron_right_rounded),
+                    onTap: () {
+                      final id = child['id']?.toString() ?? '';
+                      if (id.isNotEmpty) _openAnotherChild(id);
+                    },
+                  ),
+                  if (child != _children.last)
+                    const Divider(color: ChildProfileColors.border),
+                ],
+              ],
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: _isUpdating || _isDeleting ? null : _addChild,
+              icon: const Icon(Icons.person_add_alt_1_rounded),
+              label: const Text('Add Another Child'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: ChildProfileColors.green,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1550,6 +1998,12 @@ class _ChildProfileScreenState
       content: Column(
         children: [
           _detailRow(
+            label: 'Guardian Name',
+            value: _stringValue(_profile?['guardian_name']),
+            icon: Icons.person_outline_rounded,
+          ),
+          const Divider(color: ChildProfileColors.border),
+          _detailRow(
             label: 'Mobile',
 
             value: _stringValue(
@@ -1840,6 +2294,24 @@ class _ChildProfileScreenState
             'This doctor is linked to the child profile. '
                 'Access to health information follows '
                 'backend permissions.',
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 9,
+            runSpacing: 9,
+            children: [
+              OutlinedButton.icon(
+                onPressed: _loadingDoctorOverview ? null : _showDoctorOverview,
+                icon: const Icon(Icons.medical_information_outlined),
+                label: Text(_loadingDoctorOverview ? 'Loading...' : 'Doctor Care Overview'),
+              ),
+              TextButton.icon(
+                onPressed: _isDisconnectingDoctor ? null : _disconnectDoctor,
+                icon: const Icon(Icons.link_off_rounded, color: ChildProfileColors.error),
+                label: const Text('Disconnect Doctor',
+                    style: TextStyle(color: ChildProfileColors.error)),
+              ),
+            ],
           ),
         ],
       ),
@@ -2556,6 +3028,291 @@ class _ChildDoctorReferralDialogState
           ),
 
           child: const Text('Connect Doctor'),
+        ),
+      ],
+    );
+  }
+}
+
+// ============================================================
+// EDIT CHILD PROFILE DIALOG - FULL BACKEND V5 PAYLOAD
+// ============================================================
+
+class _EditableEmergencyContact {
+  final TextEditingController name;
+  final TextEditingController mobile;
+  final TextEditingController relationship;
+
+  _EditableEmergencyContact({Map<String, dynamic>? initial})
+      : name = TextEditingController(text: '${initial?['name'] ?? ''}'),
+        mobile = TextEditingController(text: '${initial?['mobile_number'] ?? ''}'),
+        relationship = TextEditingController(text: '${initial?['relationship'] ?? ''}');
+
+  Map<String, dynamic> toJson() => {
+    'name': name.text.trim(),
+    'mobile_number': mobile.text.trim(),
+    'relationship': relationship.text.trim(),
+  };
+
+  void dispose() {
+    name.dispose();
+    mobile.dispose();
+    relationship.dispose();
+  }
+}
+
+class _ChildProfileEditDialog extends StatefulWidget {
+  final Map<String, dynamic> profile;
+
+  const _ChildProfileEditDialog({required this.profile});
+
+  @override
+  State<_ChildProfileEditDialog> createState() => _ChildProfileEditDialogState();
+}
+
+class _ChildProfileEditDialogState extends State<_ChildProfileEditDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _name;
+  late final TextEditingController _guardianName;
+  late final TextEditingController _guardianMobile;
+  final List<_EditableEmergencyContact> _contacts = [];
+  DateTime? _birthDate;
+
+  @override
+  void initState() {
+    super.initState();
+    _name = TextEditingController(text: '${widget.profile['full_name'] ?? ''}');
+    _guardianName = TextEditingController(text: '${widget.profile['guardian_name'] ?? ''}');
+    _guardianMobile = TextEditingController(text: '${widget.profile['guardian_contact'] ?? ''}');
+    _birthDate = DateTime.tryParse('${widget.profile['date_of_birth'] ?? ''}');
+    final contacts = widget.profile['emergency_contacts'];
+    if (contacts is List) {
+      for (final entry in contacts.take(5)) {
+        if (entry is Map) {
+          _contacts.add(_EditableEmergencyContact(
+            initial: Map<String, dynamic>.from(entry),
+          ));
+        }
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _guardianName.dispose();
+    _guardianMobile.dispose();
+    for (final contact in _contacts) {
+      contact.dispose();
+    }
+    super.dispose();
+  }
+
+  DateTime get _today => DateUtils.dateOnly(DateTime.now());
+
+  String _isoDate(DateTime date) =>
+      '${date.year.toString().padLeft(4, '0')}-'
+          '${date.month.toString().padLeft(2, '0')}-'
+          '${date.day.toString().padLeft(2, '0')}';
+
+  String? _nameValidation(String? input) {
+    final value = (input ?? '').trim();
+    if (value.isEmpty) return 'Name required';
+    if (value.length > 120) return 'Maximum 120 characters';
+    return null;
+  }
+
+  String? _optionalNameValidation(String? input) {
+    if ((input ?? '').trim().length > 120) return 'Maximum 120 characters';
+    return null;
+  }
+
+  String? _mobileValidation(String? input, {bool required = false}) {
+    final value = (input ?? '').trim();
+    if (value.isEmpty && !required) return null;
+    if (!RegExp(r'^\+?[1-9][0-9]{7,14}$').hasMatch(value)) {
+      return 'Enter mobile with country code, e.g. +919876543210';
+    }
+    return null;
+  }
+
+  Future<void> _selectDob() async {
+    final now = _today;
+    final first = DateTime(now.year - 13, now.month, now.day)
+        .add(const Duration(days: 1));
+    final initial = _birthDate != null && !_birthDate!.isBefore(first)
+        && !_birthDate!.isAfter(now) ? _birthDate! : now;
+    final date = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: first,
+      lastDate: now,
+      helpText: 'CHILD DATE OF BIRTH',
+    );
+    if (date != null && mounted) setState(() => _birthDate = date);
+  }
+
+  void _addContact() {
+    if (_contacts.length >= 5) return;
+    setState(() => _contacts.add(_EditableEmergencyContact()));
+  }
+
+  void _removeContact(_EditableEmergencyContact contact) {
+    setState(() => _contacts.remove(contact));
+    WidgetsBinding.instance.addPostFrameCallback((_) => contact.dispose());
+  }
+
+  void _save() {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    final dob = _birthDate;
+    if (dob == null || dob.isAfter(_today)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please select a valid date of birth.')),
+      );
+      return;
+    }
+    final age = _today.year - dob.year -
+        ((_today.month < dob.month ||
+            (_today.month == dob.month && _today.day < dob.day)) ? 1 : 0);
+    if (age > 12 || age < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Child age must be 0 to 12 years.')),
+      );
+      return;
+    }
+    Navigator.of(context).pop(<String, dynamic>{
+      'full_name': _name.text.trim(),
+      'date_of_birth': _isoDate(dob),
+      'guardian_name': _guardianName.text.trim(),
+      'guardian_contact': _guardianMobile.text.trim(),
+      'emergency_contacts': _contacts.map((entry) => entry.toJson()).toList(),
+    });
+  }
+
+  Widget _field(
+      TextEditingController controller,
+      String label, {
+        String? Function(String?)? validator,
+        TextInputType keyboardType = TextInputType.text,
+        int? maxLength,
+      }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: TextFormField(
+        controller: controller,
+        validator: validator,
+        keyboardType: keyboardType,
+        maxLength: maxLength,
+        decoration: InputDecoration(
+          labelText: label,
+          isDense: true,
+          border: const OutlineInputBorder(),
+        ),
+      ),
+    );
+  }
+
+  Widget _contactCard(_EditableEmergencyContact contact, int index) {
+    return Container(
+      key: ObjectKey(contact),
+      padding: const EdgeInsets.all(12),
+      margin: const EdgeInsets.only(bottom: 12),
+      decoration: BoxDecoration(
+        border: Border.all(color: ChildProfileColors.border),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        children: [
+          Row(children: [
+            Expanded(child: Text('Emergency Contact ${index + 1}',
+                style: const TextStyle(fontWeight: FontWeight.w700))),
+            IconButton(
+              tooltip: 'Remove emergency contact',
+              onPressed: () => _removeContact(contact),
+              icon: const Icon(Icons.close, color: ChildProfileColors.error),
+            ),
+          ]),
+          _field(contact.name, 'Name', validator: _nameValidation,
+              maxLength: 120),
+          _field(contact.relationship, 'Relationship',
+              validator: (value) => (value ?? '').trim().isEmpty
+                  ? 'Relationship required'
+                  : (value ?? '').trim().length > 50
+                  ? 'Maximum 50 characters' : null,
+              maxLength: 50),
+          _field(contact.mobile, 'Mobile number (country code)',
+              keyboardType: TextInputType.phone,
+              validator: (value) => _mobileValidation(value, required: true),
+              maxLength: 16),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      title: const Text('Edit Child Profile'),
+      content: SizedBox(
+        width: 460,
+        child: SingleChildScrollView(
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Changes will update this child in your account. '
+                    'All existing emergency contacts are loaded for editing.',
+                    style: TextStyle(fontSize: 11, color: ChildProfileColors.muted)),
+                const SizedBox(height: 14),
+                _field(_name, 'Child full name', validator: _nameValidation,
+                    maxLength: 120),
+                OutlinedButton.icon(
+                  onPressed: _selectDob,
+                  icon: const Icon(Icons.cake_outlined),
+                  label: Text(_birthDate == null
+                      ? 'Select Date of Birth' : _isoDate(_birthDate!)),
+                ),
+                const SizedBox(height: 14),
+                _field(_guardianName, 'Guardian full name',
+                    validator: _optionalNameValidation, maxLength: 120),
+                _field(_guardianMobile, 'Guardian mobile (with country code)',
+                    keyboardType: TextInputType.phone,
+                    validator: (value) => _mobileValidation(value),
+                    maxLength: 20),
+                const Divider(height: 26),
+                Row(children: [
+                  const Expanded(child: Text('Emergency Contacts',
+                      style: TextStyle(fontWeight: FontWeight.w800))),
+                  TextButton.icon(
+                    onPressed: _contacts.length >= 5 ? null : _addContact,
+                    icon: const Icon(Icons.add, size: 16),
+                    label: const Text('Add'),
+                  ),
+                ]),
+                if (_contacts.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(12),
+                    child: Text('No emergency contacts.',
+                        style: TextStyle(color: ChildProfileColors.muted)),
+                  ),
+                for (var i = 0; i < _contacts.length; i++)
+                  _contactCard(_contacts[i], i),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _save,
+          child: const Text('Save Changes'),
         ),
       ],
     );

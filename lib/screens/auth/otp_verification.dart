@@ -6,14 +6,18 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 
+import '../doctor/doctor_dashboard_screen.dart';
+import '../doctor/doctor_profile_setup_screen.dart';
+
 // ============================================================
 // FAMILYCARE+ EMAIL OTP VERIFICATION
 // ============================================================
 // Compatible with the updated SignupScreen constructor.
 // Patient: POST /api/v1/patients/verify-email, /resend-otp
 // Doctor:  POST /api/v1/doctors/verify-email, /resend-otp
-// After verification, show confirmation and navigate to the
-// login screen (patient) or approval-pending screen (doctor).
+// Patient OTP -> login (or existing caller callback).
+// Doctor OTP -> complete professional profile (not admin approval yet).
+// After submission -> limited doctor dashboard; clinical routes locked.
 // ============================================================
 
 class OTPColors {
@@ -53,8 +57,9 @@ class OtpVerificationScreen extends StatefulWidget {
   final int resendAfter;
   final int expiresIn;
 
-  // Optional integration hook. When supplied, the caller owns
-  // post-verification navigation; otherwise this screen routes.
+  // Optional PATIENT integration hook: patient callers can preserve their
+  // existing navigation. Doctor verification always opens profile setup
+  // so legacy callbacks cannot skip the required onboarding step.
   final void Function(
       BuildContext context,
       bool isDoctor,
@@ -92,6 +97,7 @@ class _OtpVerificationScreenState
   bool _loading = false;
   bool _verified = false;
   bool _navigating = false;
+  Map<String, dynamic>? _doctorVerification;
   String? _inlineError;
 
   bool get _doctor =>
@@ -326,20 +332,43 @@ class _OtpVerificationScreenState
       });
 
       if (!mounted) return;
+
+      if (_doctor) {
+        // The doctor has NOT been submitted for approval yet. The backend
+        // returns a short-lived onboarding token for profile completion.
+        final setupToken = (response['setup_token'] ?? '').toString().trim();
+        final user = _asMap(response['user']);
+        final status = (user['approval_status'] ?? '').toString().toUpperCase();
+        if (setupToken.isEmpty ||
+            user['role'] != 'DOCTOR' ||
+            status != 'PROFILE_REQUIRED' ||
+            response['requires_profile_setup'] != true) {
+          throw const OTPApiException(
+            statusCode: 0,
+            code: 'missing_setup_response',
+            message: 'Email verification succeeded, but profile setup data '
+                'was incomplete. Sign in again as Doctor to resume setup.',
+          );
+        }
+      }
+
       _ticker?.cancel();
       setState(() {
         _verified = true;
+        _doctorVerification = _doctor ? response : null;
         _challengeToken = '';
         _otpController.clear();
       });
 
-      if (widget.onVerified != null) {
-        widget.onVerified!(context, _doctor, response);
+      // The doctor's setup page must not be skipped by an old callback
+      // that routes directly to an approval-pending page.
+      if (!_doctor && widget.onVerified != null) {
+        widget.onVerified!(context, false, response);
         return;
       }
 
       // Briefly show the success state before switching screens.
-      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      await Future<void>.delayed(const Duration(milliseconds: 900));
       if (mounted) _goToDestination();
     } catch (error) {
       _showError(error);
@@ -411,11 +440,41 @@ class _OtpVerificationScreenState
   // NAVIGATION
   // ==========================================================
 
+  static Map<String, dynamic> _asMap(dynamic raw) {
+    return raw is Map
+        ? Map<String, dynamic>.from(raw)
+        : <String, dynamic>{};
+  }
+
   void _goToDestination() {
     if (!mounted || _navigating || !_verified) return;
+
+    if (_doctor) {
+      final payload = _doctorVerification;
+      final setupToken = (payload?['setup_token'] ?? '').toString().trim();
+      if (payload == null || setupToken.isEmpty) {
+        setState(() {
+          _inlineError = 'The doctor setup session is unavailable. '
+              'Sign in again as Doctor to resume onboarding.';
+        });
+        return;
+      }
+      _navigating = true;
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute<void>(
+          builder: (_) => _DoctorOnboardingFlow(
+            verification: payload,
+            apiBaseUrl: _baseUrl,
+          ),
+        ),
+            (route) => false,
+      );
+      return;
+    }
+
     _navigating = true;
     Navigator.of(context).pushNamedAndRemoveUntil(
-      _doctor ? '/doctor-approval-pending' : '/login',
+      '/login',
           (route) => false,
     );
   }
@@ -571,7 +630,7 @@ class _OtpVerificationScreenState
           const SizedBox(height: 8),
           Text(
             _verified
-                ? 'Your registration is complete.'
+                ? (_doctor ? 'Email verification is complete. Profile setup is next.' : 'Your registration is complete.')
                 : 'One last step to secure your account.',
             style: const TextStyle(color: Color(0xFFE4F5F3), fontSize: 13),
           ),
@@ -709,8 +768,8 @@ class _OtpVerificationScreenState
         if (_doctor) ...[
           const SizedBox(height: 14),
           _infoPanel(
-            'Your doctor registration will require admin approval '
-                'after your email is verified.',
+            'After email verification, complete your doctor profile '
+                'and upload documents. Admin review starts after submission.',
           ),
         ],
       ],
@@ -742,7 +801,7 @@ class _OtpVerificationScreenState
         const SizedBox(height: 14),
         Text(
           _doctor
-              ? 'Your doctor registration is awaiting admin approval.'
+              ? 'Email verified. Complete your professional profile and upload documents before admin review.'
               : 'Your patient account is verified. Sign in to continue.',
           textAlign: TextAlign.center,
           style: const TextStyle(
@@ -753,11 +812,11 @@ class _OtpVerificationScreenState
         ),
         if (_doctor) ...[
           const SizedBox(height: 19),
-          _infoPanel('Status: Pending Admin Approval'),
+          _infoPanel('Next step: Complete your doctor profile'),
         ],
         const SizedBox(height: 23),
         _primaryButton(
-          label: _doctor ? 'View Approval Status' : 'Continue to Login',
+          label: _doctor ? 'Complete Doctor Profile' : 'Continue to Login',
           icon: Icons.arrow_forward_rounded,
           onPressed: _goToDestination,
         ),
@@ -863,6 +922,118 @@ class _OtpVerificationScreenState
           ),
         ],
       ),
+    );
+  }
+}
+
+// ============================================================
+// DOCTOR ONBOARDING FLOW AFTER OTP
+// ============================================================
+// This route keeps the setup screen mounted when the doctor switches between
+// Dashboard and Set My Profile. The setup token remains in memory only.
+// No setup token is used as a clinical token. The doctor dashboard independently
+// verifies an approved session before enabling clinical navigation.
+// ============================================================
+
+class _DoctorOnboardingFlow extends StatefulWidget {
+  final Map<String, dynamic> verification;
+  final String apiBaseUrl;
+
+  const _DoctorOnboardingFlow({
+    required this.verification,
+    required this.apiBaseUrl,
+  });
+
+  @override
+  State<_DoctorOnboardingFlow> createState() => _DoctorOnboardingFlowState();
+}
+
+class _DoctorOnboardingFlowState extends State<_DoctorOnboardingFlow> {
+  late final Map<String, dynamic> _initialUser;
+  late final Map<String, dynamic> _initialDoctor;
+  late String _setupToken;
+  late String _approvalStatus;
+  bool _showProfile = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _initialUser = _map(widget.verification['user']);
+    _initialDoctor = _map(widget.verification['doctor']);
+    _setupToken = (widget.verification['setup_token'] ?? '').toString().trim();
+    _approvalStatus =
+        (_initialUser['approval_status'] ?? 'PROFILE_REQUIRED')
+            .toString()
+            .toUpperCase();
+  }
+
+  static Map<String, dynamic> _map(dynamic value) => value is Map
+      ? Map<String, dynamic>.from(value)
+      : <String, dynamic>{};
+
+  void _showDashboard() {
+    if (mounted) setState(() => _showProfile = false);
+  }
+
+  void _showSetup() {
+    if (mounted) setState(() => _showProfile = true);
+  }
+
+  void _submitted(Map<String, dynamic> result) {
+    final user = _map(result['user']);
+    if (!mounted) return;
+    setState(() {
+      // Keep both the limited dashboard AND the profile's read-only
+      // state in sync after the server confirms submission.
+      _initialUser.addAll(user);
+      _approvalStatus =
+          (user['approval_status'] ?? 'PENDING_APPROVAL')
+              .toString()
+              .toUpperCase();
+      _initialUser['approval_status'] = _approvalStatus;
+      // Setup tokens are one-time onboarding credentials. They are
+      // no longer needed after successful profile submission.
+      _setupToken = '';
+      _showProfile = false;
+    });
+  }
+
+  void _goToLogin() {
+    if (!mounted) return;
+    Navigator.of(context).pushNamedAndRemoveUntil(
+      '/login',
+          (route) => false,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // IndexedStack preserves uploaded-image/form state when switching tabs.
+    // The approved-only dashboard does not unlock clinical routes here.
+    return IndexedStack(
+      index: _showProfile ? 1 : 0,
+      children: [
+        DoctorDashboardScreen(
+          doctorName: (_initialUser['full_name'] ?? '').toString(),
+          email: (_initialUser['email'] ?? '').toString(),
+          approvalStatus: _approvalStatus,
+          doctorDetails: _initialDoctor,
+          apiBaseUrl: widget.apiBaseUrl,
+          onOpenProfile: _showSetup,
+          onGoToLogin: _goToLogin,
+        ),
+        DoctorProfileSetupScreen(
+          setupToken: _setupToken,
+          initialUser: _initialUser,
+          initialDoctor: _initialDoctor,
+          approvalStatus: (_initialUser['approval_status'] ?? 'PROFILE_REQUIRED')
+              .toString(),
+          rejectionReason: widget.verification['rejection_reason']?.toString(),
+          apiBaseUrl: widget.apiBaseUrl,
+          onSubmitted: _submitted,
+          onBackToDashboard: _showDashboard,
+        ),
+      ],
     );
   }
 }

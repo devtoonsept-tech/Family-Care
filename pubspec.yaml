@@ -41,6 +41,7 @@ dependencies:
   # Open PDF and External Links
   # Used by Health Reports Screen
   url_launcher: ^6.3.3
+  printing: ^5.15.1
 
 # ==========================================
 # DEVELOPMENT DEPENDENCIES

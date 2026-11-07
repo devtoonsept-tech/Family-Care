@@ -1,4 +1,3 @@
-
 import 'dart:async';
 import 'dart:convert';
 
@@ -31,7 +30,9 @@ import '../auth/login_screen.dart';
 // IMPORTANT:
 // Consultation journal != doctor consultation request.
 // A request is not a confirmed appointment.
-// No live call, video call, chat or appointment booking.
+// No live call, video call, chat or confirmed appointment booking.
+// Doctor-entered records are read-only to parent accounts.
+// A doctor connection may be withdrawn with explicit confirmation.
 // ============================================================
 
 class DoctorConsultationColors {
@@ -239,6 +240,9 @@ class DoctorConsultationRecord {
   final String clinicalAdvice;
   final String notes;
 
+  // Server provenance: the family cannot change doctor-authored records.
+  final bool doctorAuthored;
+
   const DoctorConsultationRecord({
     required this.id,
     required this.profileId,
@@ -253,6 +257,7 @@ class DoctorConsultationRecord {
     this.symptoms = '',
     this.clinicalAdvice = '',
     this.notes = '',
+    this.doctorAuthored = false,
   });
 
   DoctorConsultationRecord copyWith({
@@ -272,6 +277,7 @@ class DoctorConsultationRecord {
       symptoms: symptoms,
       clinicalAdvice: clinicalAdvice,
       notes: notes,
+      doctorAuthored: doctorAuthored,
     );
   }
 }
@@ -384,6 +390,10 @@ class ConsultationApiMapper {
       notes: structured
           ? _text(extra['notes'])
           : storedNotes,
+      doctorAuthored:
+      _text(json['source_role']).toUpperCase() == 'DOCTOR' ||
+          _text(json['verification_status']).toUpperCase() ==
+              'DOCTOR_REPORTED',
     );
   }
 
@@ -447,6 +457,7 @@ class DoctorConsultationRequest {
   final DateTime preferredDate;
   final String message;
   final String status;
+  final String doctorId;
 
   const DoctorConsultationRequest({
     required this.id,
@@ -454,7 +465,10 @@ class DoctorConsultationRequest {
     required this.preferredDate,
     required this.message,
     this.status = 'REQUESTED',
+    this.doctorId = '',
   });
+
+  bool get canModify => status.toUpperCase() == 'REQUESTED';
 
   factory DoctorConsultationRequest.fromApi(
       Map<String, dynamic> json,
@@ -466,6 +480,7 @@ class DoctorConsultationRequest {
       ConsultationDateFormatter.parse(json['date']),
       message: (json['notes'] ?? '').toString(),
       status: (json['status'] ?? 'REQUESTED').toString(),
+      doctorId: (json['doctor_id'] ?? '').toString(),
     );
   }
 
@@ -764,6 +779,15 @@ class _DoctorConsultationScreenState
 
   int _generation = 0;
 
+  bool get _anyMutation =>
+      _connectingDoctor || _savingJournal || _savingRequest;
+
+  DateTime? get _effectiveChildDob =>
+      widget.childDateOfBirth ??
+          ConsultationDateFormatter.optional(
+            _childProfile?['date_of_birth'],
+          );
+
   String get _baseUrl {
     final configured = widget.apiBaseUrl.trim();
 
@@ -849,6 +873,15 @@ class _DoctorConsultationScreenState
     return mounted &&
         generation == _generation &&
         profileId == widget.profileId;
+  }
+
+  bool _requestBelongsToConnectedDoctor(
+      DoctorConsultationRequest request,
+      ) {
+    final doctorId = request.doctorId.trim();
+    final connectedId = _text(_connectedDoctor?['id']);
+    return doctorId.isEmpty ||
+        (connectedId.isNotEmpty && doctorId == connectedId);
   }
 
   String _text(
@@ -1072,7 +1105,7 @@ class _DoctorConsultationScreenState
   // ==========================================================
 
   Future<void> _connectDoctor() async {
-    if (_connectingDoctor ||
+    if (_anyMutation ||
         _loadingDoctor ||
         _connectedDoctor != null ||
         _childProfile == null) {
@@ -1138,9 +1171,9 @@ class _DoctorConsultationScreenState
                   ),
                   const SizedBox(height: 12),
                   const Text(
-                    'Connecting a doctor grants access '
-                        'to the linked child profile and '
-                        'medical reports.',
+                    'Connecting grants the doctor access to '
+                        'the linked child and authorised shared '
+                        'medical information, as permitted by the server.',
                     style: TextStyle(
                       fontSize: 11,
                       height: 1.5,
@@ -1175,8 +1208,7 @@ class _DoctorConsultationScreenState
       },
     );
 
-    // Dispose after dialog is dismissed.
-    // The value is already captured above.
+    // Dialog returned and the referral ID has been captured.
     controller.dispose();
 
     if (!mounted ||
@@ -1208,7 +1240,7 @@ class _DoctorConsultationScreenState
       }
 
       _showMessage(
-        _doctorError == null
+        _doctorError == null && _connectedDoctor != null
             ? 'Doctor connected successfully.'
             : 'Connection submitted. Refresh to verify.',
       );
@@ -1227,6 +1259,57 @@ class _DoctorConsultationScreenState
   }
 
   // ==========================================================
+  // DISCONNECT DOCTOR (PROFILE-SCOPED BACKEND API)
+  // ==========================================================
+
+  Future<void> _disconnectDoctor() async {
+    if (_anyMutation ||
+        _loadingDoctor ||
+        _connectedDoctor == null) {
+      return;
+    }
+
+    final doctorName = _text(
+      _connectedDoctor?['full_name'],
+      fallback: 'this doctor',
+    );
+    final confirmed = await _confirmDelete(
+      'Disconnect doctor?',
+      'Disconnect $doctorName from this child profile? '
+          'Their access to this profile will be revoked. '
+          'Previously recorded visits and requests are not deleted. '
+          'Any existing appointment outside FamilyCare+ '
+          'must be cancelled separately.',
+    );
+    if (!mounted || !confirmed || _anyMutation) return;
+
+    final profileId = widget.profileId;
+    final api = _api;
+    setState(() => _connectingDoctor = true);
+
+    try {
+      await api.call('DELETE', '${api.profilePath}/doctor');
+      if (!_validRequest(_generation, profileId)) return;
+
+      await _refreshAll();
+      if (!mounted || widget.profileId != profileId) return;
+      _showMessage(
+        _doctorError == null && _connectedDoctor == null
+            ? 'Doctor disconnected from this child.'
+            : 'Disconnect submitted. Refresh to verify.',
+      );
+    } catch (error) {
+      if (mounted && widget.profileId == profileId) {
+        _showMessage(_friendlyError(error), error: true);
+      }
+    } finally {
+      if (mounted && widget.profileId == profileId) {
+        setState(() => _connectingDoctor = false);
+      }
+    }
+  }
+
+  // ==========================================================
   // SAVE CONSULTATION JOURNAL
   // ==========================================================
 
@@ -1235,7 +1318,8 @@ class _DoctorConsultationScreenState
     bool markCompleted = false,
   }) async {
     if (_loadingJournal ||
-        _savingJournal ||
+        _anyMutation ||
+        (existing?.doctorAuthored ?? false) ||
         _journalError != null) {
       return;
     }
@@ -1252,7 +1336,7 @@ class _DoctorConsultationScreenState
       builder: (context) => _ConsultationEditorSheet(
         profileId: profileId,
         childName: widget.childName,
-        childDateOfBirth: widget.childDateOfBirth,
+        childDateOfBirth: _effectiveChildDob,
         initialDoctorName: _text(
           _connectedDoctor?['full_name'],
         ),
@@ -1318,7 +1402,9 @@ class _DoctorConsultationScreenState
   Future<void> _deleteJournal(
       DoctorConsultationRecord record,
       ) async {
-    if (_savingJournal || _loadingJournal) return;
+    if (_anyMutation || _loadingJournal || record.doctorAuthored) {
+      return;
+    }
 
     final confirmed = await _confirmDelete(
       'Delete consultation?',
@@ -1375,9 +1461,13 @@ class _DoctorConsultationScreenState
   Future<void> _openRequestEditor({
     DoctorConsultationRequest? existing,
   }) async {
-    if (_savingRequest ||
+    if (_anyMutation ||
+        _loadingDoctor ||
         _loadingRequests ||
         _connectedDoctor == null ||
+        (existing != null &&
+            (!existing.canModify ||
+                !_requestBelongsToConnectedDoctor(existing))) ||
         _requestsError != null) {
       return;
     }
@@ -1393,7 +1483,7 @@ class _DoctorConsultationScreenState
       backgroundColor: Colors.transparent,
       builder: (context) => _ConsultationRequestEditor(
         childName: widget.childName,
-        childDateOfBirth: widget.childDateOfBirth,
+        childDateOfBirth: _effectiveChildDob,
         existing: existing,
       ),
     );
@@ -1427,8 +1517,8 @@ class _DoctorConsultationScreenState
         _requestsError != null
             ? 'Request submitted. Refresh to verify.'
             : existing == null
-            ? 'Request sent to doctor queue. '
-            'Appointment is not confirmed.'
+            ? 'Consultation request saved in the doctor queue. '
+            'No appointment has been booked.'
             : 'Consultation request updated.',
       );
     } catch (error) {
@@ -1452,7 +1542,11 @@ class _DoctorConsultationScreenState
   Future<void> _withdrawRequest(
       DoctorConsultationRequest request,
       ) async {
-    if (_savingRequest || _loadingRequests) return;
+    if (_anyMutation ||
+        _loadingRequests ||
+        !request.canModify) {
+      return;
+    }
 
     final confirmed = await _confirmDelete(
       'Withdraw consultation request?',
@@ -1687,17 +1781,13 @@ class _DoctorConsultationScreenState
         actions: [
           IconButton(
             tooltip: 'Refresh',
-            onPressed: _connectingDoctor ||
-                _savingJournal ||
-                _savingRequest
-                ? null
-                : _refreshAll,
+            onPressed: _anyMutation ? null : _refreshAll,
             icon: const Icon(Icons.refresh_rounded),
           ),
         ],
       ),
       floatingActionButton:
-      _loadingJournal || _savingJournal || _journalError != null
+      _loadingJournal || _anyMutation || _journalError != null
           ? null
           : FloatingActionButton.extended(
         onPressed: () => _openJournalEditor(),
@@ -1926,7 +2016,7 @@ class _DoctorConsultationScreenState
           ),
           const SizedBox(height: 17),
           FilledButton.icon(
-            onPressed: _connectingDoctor
+            onPressed: _anyMutation
                 ? null
                 : _connectDoctor,
             icon: const Icon(
@@ -1956,6 +2046,9 @@ class _DoctorConsultationScreenState
       final email = _text(doctor['email']);
       final mobile = _text(doctor['mobile_number']);
       final referral = _text(doctor['referral_id']);
+      final specialization = _text(doctor['specialization']);
+      final qualification = _text(doctor['qualification']);
+      final clinicAddress = _text(doctor['clinic_address']);
 
       child = Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -2010,6 +2103,12 @@ class _DoctorConsultationScreenState
             ),
           ),
           const SizedBox(height: 13),
+          if (specialization.isNotEmpty)
+            _contactRow(Icons.stars_outlined, 'Specialty', specialization),
+          if (qualification.isNotEmpty)
+            _contactRow(Icons.school_outlined, 'Degree', qualification),
+          if (clinicAddress.isNotEmpty)
+            _contactRow(Icons.location_on_outlined, 'Clinic', clinicAddress),
           if (email.isNotEmpty)
             _contactRow(
               Icons.email_outlined,
@@ -2035,6 +2134,20 @@ class _DoctorConsultationScreenState
                 'live chat, calling, or booking.',
             DoctorConsultationColors.lightBlue,
             DoctorConsultationColors.blue,
+          ),
+          const SizedBox(height: 8),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton.icon(
+              onPressed: _anyMutation ? null : _disconnectDoctor,
+              icon: const Icon(Icons.link_off_rounded, size: 17),
+              label: Text(_connectingDoctor
+                  ? 'Updating connection...'
+                  : 'Disconnect Doctor'),
+              style: TextButton.styleFrom(
+                foregroundColor: DoctorConsultationColors.red,
+              ),
+            ),
           ),
         ],
       );
@@ -2120,8 +2233,9 @@ class _DoctorConsultationScreenState
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
-                onPressed: _savingRequest ||
+                onPressed: _anyMutation ||
                     _loadingRequests ||
+                    _loadingDoctor ||
                     _requestsError != null
                     ? null
                     : () => _openRequestEditor(),
@@ -2220,12 +2334,36 @@ class _DoctorConsultationScreenState
               request.message,
             ),
           ],
+          if (!request.canModify) ...[
+            const SizedBox(height: 9),
+            const Text(
+              'This request is not pending; editing and withdrawal '
+                  'are unavailable from the family screen.',
+              style: TextStyle(
+                fontSize: 11,
+                color: DoctorConsultationColors.muted,
+              ),
+            ),
+          ] else if (!_requestBelongsToConnectedDoctor(request)) ...[
+            const SizedBox(height: 9),
+            const Text(
+              'This request belongs to a previously linked doctor. '
+                  'It cannot be edited for the newly connected doctor. '
+                  'You may withdraw it.',
+              style: TextStyle(
+                fontSize: 11,
+                color: DoctorConsultationColors.muted,
+              ),
+            ),
+          ],
           const Divider(height: 22),
           Row(
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
               TextButton.icon(
-                onPressed: _savingRequest ||
+                onPressed: _anyMutation ||
+                    !request.canModify ||
+                    !_requestBelongsToConnectedDoctor(request) ||
                     _connectedDoctor == null
                     ? null
                     : () => _openRequestEditor(
@@ -2238,7 +2376,7 @@ class _DoctorConsultationScreenState
                 label: const Text('Edit'),
               ),
               TextButton.icon(
-                onPressed: _savingRequest
+                onPressed: _anyMutation || !request.canModify
                     ? null
                     : () => _withdrawRequest(request),
                 icon: const Icon(
@@ -2594,13 +2732,13 @@ class _DoctorConsultationScreenState
                     _deleteJournal(record);
                   }
                 },
+                enabled: !_anyMutation && !record.doctorAuthored,
                 itemBuilder: (context) => [
                   const PopupMenuItem(
                     value: 'edit',
                     child: Text('Edit'),
                   ),
-                  if (record.status ==
-                      ConsultationStatus.planned)
+                  if (record.status == ConsultationStatus.planned)
                     const PopupMenuItem(
                       value: 'completed',
                       child: Text('Mark Completed'),
@@ -2614,6 +2752,17 @@ class _DoctorConsultationScreenState
             ],
           ),
           const SizedBox(height: 12),
+          if (record.doctorAuthored) ...[
+            const Text(
+              'Doctor-entered record • Read-only for family accounts',
+              style: TextStyle(
+                fontSize: 11,
+                color: DoctorConsultationColors.green,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
           Wrap(
             spacing: 8,
             runSpacing: 7,
@@ -2657,7 +2806,7 @@ class _DoctorConsultationScreenState
           if (record.clinicalAdvice.isNotEmpty) ...[
             const SizedBox(height: 10),
             _detailBlock(
-              'Doctor Advice / Visit Summary',
+              'Parent-entered visit advice / summary',
               record.clinicalAdvice,
             ),
           ],
@@ -2684,7 +2833,7 @@ class _DoctorConsultationScreenState
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
               TextButton.icon(
-                onPressed: _savingJournal
+                onPressed: _anyMutation || record.doctorAuthored
                     ? null
                     : () => _openJournalEditor(
                   existing: record,
@@ -2696,7 +2845,7 @@ class _DoctorConsultationScreenState
                 label: const Text('Edit'),
               ),
               TextButton.icon(
-                onPressed: _savingJournal
+                onPressed: _anyMutation || record.doctorAuthored
                     ? null
                     : () => _deleteJournal(record),
                 icon: const Icon(
@@ -3222,6 +3371,7 @@ class _ConsultationEditorSheetState
       symptoms: _symptoms.text.trim(),
       clinicalAdvice: _advice.text.trim(),
       notes: _notes.text.trim(),
+      doctorAuthored: widget.existing?.doctorAuthored ?? false,
     );
 
     try {
@@ -3389,7 +3539,7 @@ class _ConsultationEditorSheetState
             const SizedBox(height: 17),
             _formTextField(
               controller: _advice,
-              label: 'Doctor Advice / Visit Summary',
+              label: 'Reported Doctor Advice / Visit Summary',
               hint: 'Enter advice given during the visit',
               icon: Icons.medical_information_outlined,
               maxLength: 1200,
@@ -3544,6 +3694,7 @@ class _ConsultationRequestEditorState
         preferredDate: _preferredDate,
         message: _message.text.trim(),
         status: widget.existing?.status ?? 'REQUESTED',
+        doctorId: widget.existing?.doctorId ?? '',
       ),
     );
   }
